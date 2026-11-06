@@ -131,11 +131,16 @@ func (c *resyncServiceClient) PatchSchedule(ctx context.Context, req *workflowse
 
 type resyncTemporalClient struct {
 	client.Client
-	service workflowservice.WorkflowServiceClient
+	service   workflowservice.WorkflowServiceClient
+	schedules client.ScheduleClient
 }
 
 func (c *resyncTemporalClient) WorkflowService() workflowservice.WorkflowServiceClient {
 	return c.service
+}
+
+func (c *resyncTemporalClient) ScheduleClient() client.ScheduleClient {
+	return c.schedules
 }
 
 func TestClearFollowupRetriesUseSameScheduleRequestID(t *testing.T) {
@@ -173,7 +178,7 @@ func TestClearFollowupRetriesUseSameScheduleRequestID(t *testing.T) {
 		require.Equal(t, utils.GetTemporalNamespace(), req.Namespace)
 		require.Equal(t, enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE, req.Patch.TriggerImmediately.OverlapPolicy)
 		require.Empty(t, req.Patch.Pause)
-		require.Empty(t, req.Patch.Unpause)
+		require.NotEmpty(t, req.Patch.Unpause)
 	}
 	env.AssertExpectations(t)
 }

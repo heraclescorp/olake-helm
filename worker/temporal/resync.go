@@ -22,6 +22,7 @@ func (a *Activity) TriggerSyncAfterClearActivity(ctx context.Context, req *types
 		ScheduleId: scheduleID,
 		RequestId:  activity.GetInfo(ctx).WorkflowExecution.RunID + "/table-resync-sync",
 		Patch: &schedulepb.SchedulePatch{
+			Unpause: "Table resync clear persisted; starting sync",
 			TriggerImmediately: &schedulepb.TriggerImmediatelyRequest{
 				OverlapPolicy: enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE,
 			},
