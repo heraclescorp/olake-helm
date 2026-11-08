@@ -58,6 +58,9 @@ const (
 	StreamsFile          = "streams.json"
 	AvailableStreamsFile = "available_streams.json"
 	SelectedStreamsFile  = "selected_streams.json"
+	// EnrollmentGateFile distinguishes a failed metadata preflight from a sync
+	// whose connector launched and must persist its state during cleanup.
+	EnrollmentGateFile = "auto-enrollment-gate.json"
 	// Storage modes (OLAKE_STORAGE_MODE values)
 	StorageModeNFS = "nfs"
 	StorageModeS3  = "s3"
