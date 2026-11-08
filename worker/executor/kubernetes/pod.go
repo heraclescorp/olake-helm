@@ -352,12 +352,13 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 			SecurityContext:              k.config.SecurityContext,
 			Containers: []corev1.Container{
 				{
-					Name:         "connector",
-					Image:        imageName,
-					Command:      []string{},
-					Args:         req.Args,
-					VolumeMounts: volumeMounts,
-					Resources:    k.GetResourcesForJob(req.JobID, req.Command),
+					Name:            "connector",
+					Image:           imageName,
+					ImagePullPolicy: corev1.PullAlways,
+					Command:         []string{},
+					Args:            req.Args,
+					VolumeMounts:    volumeMounts,
+					Resources:       k.GetResourcesForJob(req.JobID, req.Command),
 					Env: []corev1.EnvVar{
 						{
 							Name:  "OLAKE_WORKFLOW_ID",
