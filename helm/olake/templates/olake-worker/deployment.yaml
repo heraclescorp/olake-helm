@@ -121,7 +121,7 @@ spec:
       {{- end }}
       containers:
       - name: olake-workers
-        image: "{{ include "olake.registryBase" . }}/{{ .Values.olakeWorker.image.repository }}:{{ .Values.olakeWorker.image.tag }}"
+        image: {{ include "olake.image" (dict "context" . "image" .Values.olakeWorker.image) | quote }}
         imagePullPolicy: {{ .Values.olakeWorker.image.pullPolicy }}
         ports:
         - name: health
