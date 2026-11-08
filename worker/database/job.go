@@ -92,7 +92,7 @@ func (db *DB) jobDataQuery(ctx context.Context) (string, error) {
 	return fmt.Sprintf(`
 		SELECT j.name, j.streams_config, %s, %s, j.state, j.project_id,
 			s.config, d.config, s.version, s.type, COALESCE(j.advanced_settings::text, ''),
-			j.frequency, j.created_at, d.version, s.name, d.name, j.source_id, j.dest_id, d.type
+			j.frequency, j.created_at, d.version, s.name, d.name, j.source_id, j.dest_id, d.dest_type
 		FROM %q j
 		JOIN %q s ON j.source_id = s.id
 		JOIN %q d ON j.dest_id = d.id

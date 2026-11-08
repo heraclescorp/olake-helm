@@ -99,7 +99,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 	db := &DB{client: client, tables: map[string]string{"job": "enrollment_job", "source": "enrollment_source", "dest": "enrollment_destination"}}
 	_, err = client.ExecContext(ctx, `
 		CREATE TABLE enrollment_source(id integer PRIMARY KEY, config text, version text, type text, name text);
-		CREATE TABLE enrollment_destination(id integer PRIMARY KEY, config text, version text, type text, name text);
+		CREATE TABLE enrollment_destination(id integer PRIMARY KEY, config text, version text, dest_type text, name text);
 		CREATE TABLE enrollment_job(id integer PRIMARY KEY, name text, streams_config text, available_streams_config text,
 			selected_streams_config text, state text, project_id text, source_id integer, dest_id integer,
 			advanced_settings jsonb, frequency text, created_at timestamptz, updated_at timestamptz);
@@ -119,6 +119,20 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 		require.NoError(t, err)
 		return job
 	}
+	t.Run("ordinary job loading without automatic enrollment", func(t *testing.T) {
+		reset(t)
+		_, err := client.ExecContext(ctx, `UPDATE enrollment_job SET advanced_settings='{"auto_table_enrollment":{"enabled":false}}' WHERE id=42`)
+		require.NoError(t, err)
+		job, err := db.GetJobData(ctx, 42)
+		require.NoError(t, err)
+		require.Equal(t, "postgres", job.Driver)
+		require.Equal(t, "iceberg", job.DestinationDriver)
+		require.Equal(t, dbOldCatalog, job.Streams)
+		require.Equal(t, state, job.State)
+		policy, err := job.AutoTableEnrollment()
+		require.NoError(t, err)
+		require.Nil(t, policy)
+	})
 	t.Run("durable commit preserves global state and retry does not duplicate", func(t *testing.T) {
 		original := reset(t)
 		// State may advance independently while discovery is running.
