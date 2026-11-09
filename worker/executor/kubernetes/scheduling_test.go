@@ -13,7 +13,10 @@ func TestLoadJobProfilesResources(t *testing.T) {
 		"456": {"nodeSelector": {"node-type": "big"}, "resources": {"requests": {"memory": "4Gi"}, "limits": {"memory": "1Gi"}}}
 	}`
 
-	profiles := LoadJobProfiles(raw)
+	profiles, err := LoadJobProfiles(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(profiles) != 3 {
 		t.Fatalf("expected 3 profiles, got %d", len(profiles))
 	}
@@ -49,7 +52,10 @@ func TestLoadJobProfilesRejectsNegativeResources(t *testing.T) {
 		"2": {"resources": {"limits": {"memory": "-1Gi"}}}
 	}`
 
-	profiles := LoadJobProfiles(raw)
+	profiles, err := LoadJobProfiles(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for jobID, profile := range profiles {
 		if profile.Resources != nil {
 			t.Errorf("job %d: negative resources should be dropped", jobID)
@@ -67,7 +73,10 @@ func TestLoadJobProfilesIsolatesBadProfiles(t *testing.T) {
 		"456": {"nodeSelector": "not-a-map"}
 	}`
 
-	profiles := LoadJobProfiles(raw)
+	profiles, err := LoadJobProfiles(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// A good profile survives a bad neighbour
 	if mem := profiles[0].Resources.Requests[corev1.ResourceMemory]; mem.String() != "1Gi" {
@@ -89,7 +98,10 @@ func TestLoadJobProfilesIsolatesBadProfiles(t *testing.T) {
 }
 
 func TestLoadJobProfilesWithoutResources(t *testing.T) {
-	profiles := LoadJobProfiles(`{"0": {"nodeSelector": {"node-type": "standard"}}}`)
+	profiles, err := LoadJobProfiles(`{"0": {"nodeSelector": {"node-type": "standard"}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if profiles[0].Resources != nil {
 		t.Errorf("resources should stay nil when not configured")
 	}
