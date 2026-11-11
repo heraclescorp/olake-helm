@@ -22,10 +22,14 @@ type JobMappingStats struct {
 
 // JobSchedulingConfig defines the scheduling constraints and compute resources for a job
 type JobSchedulingConfig struct {
-	NodeSelector map[string]string            `json:"nodeSelector,omitempty"`
-	Tolerations  []corev1.Toleration          `json:"tolerations,omitempty"`
-	Affinity     *corev1.Affinity             `json:"affinity,omitempty"`
-	Resources    *corev1.ResourceRequirements `json:"resources,omitempty"`
+	NodeSelector  map[string]string            `json:"nodeSelector,omitempty"`
+	Tolerations   []corev1.Toleration          `json:"tolerations,omitempty"`
+	Affinity      *corev1.Affinity             `json:"affinity,omitempty"`
+	Resources     *corev1.ResourceRequirements `json:"resources,omitempty"`
+	RuntimeMemory *RuntimeMemoryConfig         `json:"runtimeMemory,omitempty"`
+
+	resourcesErr     error
+	runtimeMemoryErr error
 }
 
 // validateResources rejects negative quantities and a request that exceeds its limit;
@@ -166,10 +170,8 @@ func LoadJobMapping(rawMapping string) map[int]map[string]string {
 	return result
 }
 
-// parseJobProfile parses one profile. When only its resources fail to parse
-// (for example "2GB"), the profile is returned without resources, along with
-// the parse error as resourcesErr, so its scheduling fields still apply.
-func parseJobProfile(raw json.RawMessage) (profile JobSchedulingConfig, resourcesErr error, err error) {
+// parseSchedulingProfile preserves legacy resource fallback for profiles without a memory policy.
+func parseSchedulingProfile(raw json.RawMessage) (profile JobSchedulingConfig, resourcesErr error, err error) {
 	if err = json.Unmarshal(raw, &profile); err == nil {
 		return profile, nil, nil
 	}
@@ -194,19 +196,42 @@ func parseJobProfile(raw json.RawMessage) (profile JobSchedulingConfig, resource
 	return profile, err, nil
 }
 
+// Keep a malformed policy attached to its profile so selecting it fails closed.
+func parseJobProfile(raw json.RawMessage) (JobSchedulingConfig, error, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return JobSchedulingConfig{}, nil, err
+	}
+	policyRaw, present := fields["runtimeMemory"]
+	if !present {
+		return parseSchedulingProfile(raw)
+	}
+	delete(fields, "runtimeMemory")
+	stripped, err := json.Marshal(fields)
+	if err != nil {
+		return JobSchedulingConfig{}, nil, err
+	}
+	profile, resourcesErr, profileErr := parseSchedulingProfile(stripped)
+	profile.RuntimeMemory, profile.runtimeMemoryErr = parseRuntimeMemory(policyRaw)
+	if profileErr != nil {
+		profile.runtimeMemoryErr = fmt.Errorf("invalid profile with runtimeMemory: %w", profileErr)
+	}
+	return profile, resourcesErr, nil
+}
+
 // LoadJobProfiles parses OLAKE_JOB_PROFILES JSON string
 // Does NOT validate NodeSelector labels - trusts user input for new format
-func LoadJobProfiles(profiles string) map[int]JobSchedulingConfig {
+func LoadJobProfiles(profiles string) (map[int]JobSchedulingConfig, error) {
 	if strings.TrimSpace(profiles) == "" {
 		logger.Info("no Job Profiles found")
-		return map[int]JobSchedulingConfig{}
+		return map[int]JobSchedulingConfig{}, nil
 	}
 
 	// Parse each profile separately so one bad entry cannot drop every other profile
 	rawProfiles := make(map[int]json.RawMessage)
 	if err := json.Unmarshal([]byte(profiles), &rawProfiles); err != nil {
 		logger.Errorf("failed to parse OLAKE_JOB_PROFILES as json: %s", err)
-		return map[int]JobSchedulingConfig{}
+		return nil, fmt.Errorf("invalid OLAKE_JOB_PROFILES: %w", err)
 	}
 
 	result := make(map[int]JobSchedulingConfig, len(rawProfiles))
@@ -217,12 +242,14 @@ func LoadJobProfiles(profiles string) map[int]JobSchedulingConfig {
 			continue
 		}
 		if resourcesErr != nil {
-			logger.Warnf("job profile %d: ignoring unparsable resources, falling back to default: %s", jobID, resourcesErr)
+			logger.Warnf("job profile %d: unparsable resources (fallback only without runtimeMemory): %s", jobID, resourcesErr)
+			profile.resourcesErr = resourcesErr
 		}
 
 		// Drop only the invalid resources so the profile's scheduling fields still apply
 		if err := validateResources(profile.Resources); err != nil {
-			logger.Warnf("job profile %d: ignoring resources, falling back to default: %s", jobID, err)
+			logger.Warnf("job profile %d: invalid resources (fallback only without runtimeMemory): %s", jobID, err)
+			profile.resourcesErr = err
 			profile.Resources = nil
 		}
 		result[jobID] = profile
@@ -236,5 +263,5 @@ func LoadJobProfiles(profiles string) map[int]JobSchedulingConfig {
 		}
 	}
 
-	return result
+	return result, nil
 }

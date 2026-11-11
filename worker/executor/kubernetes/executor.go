@@ -140,7 +140,10 @@ func (k *KubernetesExecutor) Execute(ctx context.Context, req *types.ExecutionRe
 		return "", err
 	}
 
-	podSpec := k.CreatePodSpec(req, workdir, imageName, indexVolume)
+	podSpec, err := k.CreatePodSpec(req, workdir, imageName, indexVolume)
+	if err != nil {
+		return "", err
+	}
 	log.Info(fmt.Sprintf("Starting pod %s with image %s", podSpec.Name, imageName))
 
 	if _, err := k.createPod(ctx, podSpec); err != nil {

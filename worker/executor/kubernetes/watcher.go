@@ -25,10 +25,11 @@ type ConfigMapWatcher struct {
 	configMapName   string
 
 	// Thread-safe job mapping storage
-	mu          sync.RWMutex
-	jobMapping  map[int]map[string]string // TODO: use sync.Map
-	jobProfiles map[int]JobSchedulingConfig
-	jobIndexes  JobIndexes
+	mu             sync.RWMutex
+	jobMapping     map[int]map[string]string // TODO: use sync.Map
+	jobProfiles    map[int]JobSchedulingConfig
+	jobProfilesErr error
+	jobIndexes     JobIndexes
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -208,11 +209,12 @@ func (w *ConfigMapWatcher) updateJobMapping(cm *corev1.ConfigMap) {
 
 	// 2. Load job profiles
 	if rawProfiles, exists := cm.Data["OLAKE_JOB_PROFILES"]; exists && rawProfiles != "" {
-		w.jobProfiles = LoadJobProfiles(rawProfiles)
+		w.jobProfiles, w.jobProfilesErr = LoadJobProfiles(rawProfiles)
 		logger.Infof("updated job profiles with %d entries", len(w.jobProfiles))
 	} else {
 		logger.Debugf("no OLAKE_JOB_PROFILES in ConfigMap %s", w.configMapName)
 		w.jobProfiles = map[int]JobSchedulingConfig{}
+		w.jobProfilesErr = nil
 	}
 
 	// 3. Load per-job index storage settings

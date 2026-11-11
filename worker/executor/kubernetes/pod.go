@@ -268,7 +268,11 @@ func (k *KubernetesExecutor) cleanupPod(ctx context.Context, podName string) err
 
 // CreatePodSpec builds the connector pod. indexVolume is nil for operations that
 // carry no Pebble index (spec, check, discover) or when index storage is disabled.
-func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir, imageName string, indexVolume *indexVolume) *corev1.Pod {
+func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir, imageName string, indexVolume *indexVolume) (*corev1.Pod, error) {
+	resources, runtimeEnv, err := k.resourcesAndRuntimeEnvForJob(req.JobID, req.Command)
+	if err != nil {
+		return nil, fmt.Errorf("job %d operation %s: %w", req.JobID, req.Command, err)
+	}
 	subDir := filepath.Base(workDir)
 
 	var volumeMounts []corev1.VolumeMount
@@ -358,11 +362,33 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 					Command:         []string{},
 					Args:            req.Args,
 					VolumeMounts:    volumeMounts,
-					Resources:       k.GetResourcesForJob(req.JobID, req.Command),
+					Resources:       resources,
 					Env: []corev1.EnvVar{
 						{
 							Name:  "OLAKE_WORKFLOW_ID",
 							Value: req.WorkflowID,
+						},
+						{
+							Name:  "OLAKE_JOB_ID",
+							Value: strconv.Itoa(req.JobID),
+						},
+						{
+							Name:  "OLAKE_OPERATION_TYPE",
+							Value: string(req.Command),
+						},
+						{
+							Name: "POD_NAME",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+								APIVersion: "v1",
+								FieldPath:  "metadata.name",
+							}},
+						},
+						{
+							Name: "POD_NAMESPACE",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+								APIVersion: "v1",
+								FieldPath:  "metadata.namespace",
+							}},
 						},
 						{
 							Name:  constants.EnvS3ConfigFolder,
@@ -379,6 +405,7 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 			Volumes: volumes,
 		},
 	}
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, runtimeEnv...)
 
 	// Mount the per-job index volume. The claim is keyed on JobID alone, so a
 	// job's sync and clear-destination runs open the same Pebble index.
@@ -440,7 +467,7 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 		}
 	}
 
-	return pod
+	return pod, nil
 }
 
 func (k *KubernetesExecutor) createPod(ctx context.Context, podSpec *corev1.Pod) (*corev1.Pod, error) {

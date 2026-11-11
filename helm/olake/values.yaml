@@ -50,7 +50,7 @@ global:
 
   # -- JobID-based scheduling profiles for pods created by olake-workers
   # Supports full Kubernetes scheduling capabilities (NodeSelector, Tolerations, Affinity)
-  # and optional compute resources (Resources).
+  # and optional compute resources (Resources) and Go/JVM budgets (runtimeMemory).
   # Overrides `jobMapping` if both are defined for the same JobID.
   #
   # Special Key "0": Defines the DEFAULT profile for all short-lived jobs (test, discover, spec)
@@ -98,6 +98,23 @@ global:
   #           memory: "8Gi"
   #         limits:
   #           memory: "8Gi"
+  # runtimeMemory (optional): select exactly one of goLimit (Kubernetes memory quantity)
+  # or goPercent (integer), plus required integer javaPercent. Resolved budgets must
+  # total at most 80% of the effective connector container memory LIMIT, not request.
+  # Requires a finite positive limit; invalid selected policies fail before pod creation.
+  # Async jobs use their own policy, then profile "0"; discover/test/spec use only "0".
+  # Explicit GOMEMLIMIT and OLAKE_JAVA_HEAP_PERCENT override global.env for that pod.
+  # No policy leaves inherited runtime budget variables unchanged. Do not set budgets globally.
+  # Example added to job 123 above:
+  #       runtimeMemory:
+  #         goPercent: 20
+  #         javaPercent: 50
+  # Policies use effective resources after resource fallback; request/limit fields are not merged.
+  # Invalid whole OLAKE_JOB_PROFILES JSON blocks launches until corrected; invalid individual
+  # policies block only operations selecting that policy, never falling back to an unbudgeted pod.
+  # Budgets leave 20% headroom but are not hard process RSS limits.
+  # Every connector receives OLAKE_JOB_ID and OLAKE_OPERATION_TYPE; workflow metadata is retained.
+  # POD_NAME and POD_NAMESPACE use the downward API; exporter settings remain in global.env.
   jobProfiles: {}
 
   # -- Service account configuration for job pods created by olake-workers

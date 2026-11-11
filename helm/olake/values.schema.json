@@ -41,7 +41,7 @@
         },
         "jobProfiles": {
           "type": "object",
-          "description": "Advanced scheduling profiles for specific JobIDs. Allows defining nodeSelector, tolerations, and affinity.",
+          "description": "Advanced profiles for specific JobIDs: scheduling, container resources, and optional Go/JVM runtime memory budgets.",
           "patternProperties": {
             "^[0-9]+$": {
               "type": "object",
@@ -78,7 +78,8 @@
                   "description": "Kubernetes affinity/anti-affinity rules.",
                   "additionalProperties": true
                 },
-                "resources": { "$ref": "#/definitions/resourceRequirements" }
+                "resources": { "$ref": "#/definitions/resourceRequirements" },
+                "runtimeMemory": { "$ref": "#/definitions/runtimeMemory" }
               },
               "additionalProperties": false
             }
@@ -105,6 +106,35 @@
     }
   },
   "definitions": {
+    "runtimeMemory": {
+      "type": "object",
+      "description": "Go/JVM budgets derived from the effective connector container memory limit. Their sum must not exceed 80% of that limit; the worker rejects invalid selected policies before creating a pod.",
+      "properties": {
+        "goLimit": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Positive Kubernetes memory quantity for GOMEMLIMIT, e.g. 16Gi. Mutually exclusive with goPercent."
+        },
+        "goPercent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 80,
+          "description": "Percentage of the container memory limit for GOMEMLIMIT. Mutually exclusive with goLimit."
+        },
+        "javaPercent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 80,
+          "description": "Per-JVM MaxRAMPercentage, passed as OLAKE_JAVA_HEAP_PERCENT."
+        }
+      },
+      "required": ["javaPercent"],
+      "oneOf": [
+        { "required": ["goLimit"] },
+        { "required": ["goPercent"] }
+      ],
+      "additionalProperties": false
+    },
     "resourceQuantity": {
       "type": ["string", "number"],
       "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$",
