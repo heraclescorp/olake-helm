@@ -407,6 +407,7 @@ func RevertUpdatesInSchedule(req *types.ExecutionRequest) {
 	if req.StartSyncAfterClear {
 		req.StartSyncAfterClear = false
 		req.TempPath = ""
+		req.Configs = nil
 	}
 }
 

@@ -25,10 +25,15 @@ type activityExecutor interface {
 	CleanupAndPersistState(context.Context, *types.ExecutionRequest) error
 }
 
+type activityDatabase interface {
+	GetJobData(context.Context, int) (types.JobData, error)
+	CommitCatalogEnrollment(context.Context, int, types.JobData, types.EnrollmentResult) error
+	GetProjectSettingsByProjectID(context.Context, string) (*types.ProjectSettings, error)
+}
 type Activity struct {
 	executor   activityExecutor
 	indicator  executor.FailureIndicator
-	db         *database.DB
+	db         activityDatabase
 	tempClient client.Client
 }
 
@@ -99,6 +104,16 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 	if req.ConnectorType == "" {
 		utils.UpdateSyncRequestForLegacy(jobDetails, req)
 	}
+	// Metadata-only discovery must durably commit additions before any ingestion
+	// config is built. Opted-out jobs never execute or read a preflight result.
+	jobDetails, err = a.enrollNewTables(ctx, req, jobDetails)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, temporal.NewCanceledError("automatic table enrollment cancelled")
+		}
+		return nil, temporal.NewNonRetryableApplicationError(err.Error(), "AutoTableEnrollmentFailed", err)
+	}
+	req.ConnectorType = jobDetails.Driver
 
 	// The index volume is opt-in per job, so a deployment whose jobs do not use
 	// the Iceberg delete path provisions no storage at all.

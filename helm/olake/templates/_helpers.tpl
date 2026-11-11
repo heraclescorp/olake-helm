@@ -223,6 +223,20 @@ Uses CONTAINER_REGISTRY_BASE from global.env if set, otherwise defaults to docke
 {{- end -}}
 
 {{/*
+Render an image from context and an existing image map. Registry-qualified
+repositories bypass the global registry; tags are appended unchanged.
+*/}}
+{{- define "olake.image" -}}
+{{- $repository := .image.repository -}}
+{{- $firstComponent := first (splitList "/" $repository) -}}
+{{- $qualified := and (contains "/" $repository) (or (contains "." $firstComponent) (contains ":" $firstComponent) (eq "localhost" $firstComponent)) -}}
+{{- if not $qualified -}}
+{{- include "olake.registryBase" .context -}}/
+{{- end -}}
+{{- $repository -}}:{{- .image.tag -}}
+{{- end -}}
+
+{{/*
 Return the PostgreSQL secret name
 */}}
 {{- define "olake.postgresql.secretName" -}}

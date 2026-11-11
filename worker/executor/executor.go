@@ -28,10 +28,14 @@ type FailureIndicator interface {
 	Indicator(ctx context.Context, req *types.IndicatorRequest) error
 }
 
+type jobStateStore interface {
+	UpdateJobState(context.Context, int, string) error
+}
+
 type AbstractExecutor struct {
 	executor  Executor
 	indicator FailureIndicator
-	db        *database.DB
+	db        jobStateStore
 }
 
 // NewExecutor creates and returns the executor client based on the executor environment
@@ -70,6 +74,11 @@ func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequ
 			return nil, err
 		}
 	}
+	if req.Command == types.Sync {
+		if err := utils.MarkEnrollmentIngestionStarted(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 
 	output, err := a.executor.Execute(ctx, req, workdir)
 	if err != nil {
@@ -79,7 +88,7 @@ func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequ
 		}
 		return nil, err
 	}
-	if req.Command != types.Sync {
+	if req.Command != types.Sync && req.Command != types.DiscoverNewTables {
 		log.Info("executor output", "environment", utils.GetExecutorEnvironment(), "output", stripansi.Strip(output))
 	}
 
@@ -109,9 +118,21 @@ func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequ
 func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *types.ExecutionRequest) error {
 	log := logger.Log(ctx)
 
+	var gateErr error
+	if req.Command == types.Sync {
+		pending, err := utils.EnrollmentPreflightPending(ctx, req)
+		gateErr = err
+		if err == nil && pending {
+			log.Info("metadata preflight ended before ingestion; preserving saved job state", "jobID", req.JobID)
+			return nil
+		}
+	}
 	if err := a.executor.Cleanup(ctx, req); err != nil {
 		log.Error("failed to cleanup executor", "workflowID", req.WorkflowID, "error", err)
 		return err
+	}
+	if gateErr != nil {
+		return gateErr
 	}
 
 	stateFile, err := utils.GetStateFileFromWorkdir(ctx, req.WorkflowID, req.Command)

@@ -66,47 +66,54 @@ func (db *DB) GetJobData(ctx context.Context, jobId int) (types.JobData, error) 
 	cctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
+	query, err := db.jobDataQuery(cctx)
+	if err != nil {
+		return types.JobData{}, err
+	}
+	jobData, err := scanJobData(db.client.QueryRowContext(cctx, query, jobId))
+	if err != nil {
+		log.Error("failed to get job data from database", "jobID", jobId, "error", err)
+	}
+	return jobData, err
+}
+
+// The same joined projection is used by preflight's locked comparison and by
+// ordinary reads, including optional split-catalog columns on older databases.
+func (db *DB) jobDataQuery(ctx context.Context) (string, error) {
 	jobTable := db.tables["job"]
-	// The catalog columns may not exist yet when the worker runs against a database the UI has
-	// not migrated; read them as NULL then.
-	selectedStreamsExpr, err := optionalColumn(cctx, db, jobTable, "selected_streams_config")
+	selectedStreamsExpr, err := optionalColumn(ctx, db, jobTable, "selected_streams_config")
 	if err != nil {
-		log.Error("failed to check selected_streams_config column", "jobID", jobId, "error", err)
-		return types.JobData{}, fmt.Errorf("failed to check selected_streams_config column: %w", err)
+		return "", err
 	}
-	availableStreamsExpr, err := optionalColumn(cctx, db, jobTable, "available_streams_config")
+	availableStreamsExpr, err := optionalColumn(ctx, db, jobTable, "available_streams_config")
 	if err != nil {
-		log.Error("failed to check available_streams_config column", "jobID", jobId, "error", err)
-		return types.JobData{}, fmt.Errorf("failed to check available_streams_config column: %w", err)
+		return "", err
 	}
+	return fmt.Sprintf(`
+		SELECT j.name, j.streams_config, %s, %s, j.state, j.project_id,
+			s.config, d.config, s.version, s.type, COALESCE(j.advanced_settings::text, ''),
+			j.frequency, j.created_at, d.version, s.name, d.name, j.source_id, j.dest_id, d.dest_type
+		FROM %q j
+		JOIN %q s ON j.source_id = s.id
+		JOIN %q d ON j.dest_id = d.id
+		WHERE j.id = $1`,
+		selectedStreamsExpr, availableStreamsExpr, jobTable, db.tables["source"], db.tables["dest"]), nil
+}
 
-	query := fmt.Sprintf(`
-			SELECT j.name, j.streams_config, %s, %s, j.state, j.project_id, s.config, d.config, s.version, s.type, COALESCE(j.advanced_settings::text, ''),
-				j.frequency, j.created_at, d.version, s.name, d.name
-			FROM %q j
-			JOIN %q s ON j.source_id = s.id
-			JOIN %q d ON j.dest_id = d.id
-			WHERE j.id = $1`,
-		selectedStreamsExpr, availableStreamsExpr, jobTable, db.tables["source"], db.tables["dest"])
-
-	rows := db.client.QueryRowContext(cctx, query, jobId)
-
+func scanJobData(row *sql.Row) (types.JobData, error) {
 	var jobData types.JobData
 	var streams, selectedStreams, availableStreams sql.NullString
-	if err := rows.Scan(&jobData.JobName, &streams, &selectedStreams, &availableStreams, &jobData.State, &jobData.ProjectID, &jobData.Source, &jobData.Destination, &jobData.Version, &jobData.Driver, &jobData.AdvancedSettings,
-		&jobData.Frequency, &jobData.CreatedAt, &jobData.DestinationVersion, &jobData.SourceName, &jobData.DestinationName); err != nil {
-		log.Error("failed to get job data from database", "jobID", jobId, "error", err)
+	if err := row.Scan(&jobData.JobName, &streams, &selectedStreams, &availableStreams,
+		&jobData.State, &jobData.ProjectID, &jobData.Source, &jobData.Destination, &jobData.Version,
+		&jobData.Driver, &jobData.AdvancedSettings, &jobData.Frequency, &jobData.CreatedAt,
+		&jobData.DestinationVersion, &jobData.SourceName, &jobData.DestinationName,
+		&jobData.SourceID, &jobData.DestinationID, &jobData.DestinationDriver); err != nil {
 		return types.JobData{}, fmt.Errorf("failed to scan job data: %w", err)
 	}
-	jobData.Streams = streams.String
-	jobData.SelectedStreams = selectedStreams.String
-	jobData.AvailableStreams = availableStreams.String
-
+	jobData.Streams, jobData.SelectedStreams, jobData.AvailableStreams = streams.String, selectedStreams.String, availableStreams.String
 	if err := decryptJobData(&jobData); err != nil {
-		log.Error("failed to decrypt job data", "jobID", jobId, "error", err)
-		return types.JobData{}, fmt.Errorf("failed to decrypt job data job_id[%d]: %s", jobId, err)
+		return types.JobData{}, fmt.Errorf("failed to decrypt job data: %w", err)
 	}
-
 	return jobData, nil
 }
 

@@ -10,11 +10,12 @@ import (
 type Command string
 
 const (
-	Discover         Command = "discover"
-	Spec             Command = "spec"
-	Check            Command = "check"
-	Sync             Command = "sync"
-	ClearDestination Command = "clear-destination"
+	Discover          Command = "discover"
+	DiscoverNewTables Command = "discover-new-tables"
+	Spec              Command = "spec"
+	Check             Command = "check"
+	Sync              Command = "sync"
+	ClearDestination  Command = "clear-destination"
 )
 
 type JobConfig struct {
@@ -37,6 +38,9 @@ type LoggingConfig struct {
 type JobData struct {
 	JobName            string
 	ProjectID          string
+	SourceID           int
+	DestinationID      int
+	DestinationDriver  string
 	Source             string
 	Destination        string
 	Streams            string
