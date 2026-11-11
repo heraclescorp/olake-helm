@@ -30,7 +30,6 @@ type activityDatabase interface {
 	CommitCatalogEnrollment(context.Context, int, types.JobData, types.EnrollmentResult) error
 	GetProjectSettingsByProjectID(context.Context, string) (*types.ProjectSettings, error)
 }
-
 type Activity struct {
 	executor   activityExecutor
 	indicator  executor.FailureIndicator
@@ -236,24 +235,15 @@ func (a *Activity) PostSyncActivity(ctx context.Context, req *types.ExecutionReq
 	return nil
 }
 
-// CRITICAL: Restore the schedule to its normal sync operation state
-//
-// When clear-destination is triggered, the backend (olake-ui) temporarily:
-// 1. Updates the sync schedule's metadata to run clear-destination instead
-// 2. Pauses the schedule to prevent the next scheduled run during the operation
-//
-// After clear-destination completes (success or failure), we must restore the schedule:
-// 1. Revert metadata back to sync operation
-// 2. Unpause the schedule to resume normal operations
-//
-// Without these steps, the schedule would remain paused and stuck in clear-destination mode,
-// preventing all future sync runs.
+// Ordinary clears resume their schedule after cleanup. Table resync restores the sync
+// action while paused; its successful follow-up patch unpauses and triggers together.
 func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRequest) error {
 	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 	defer utils.ReleaseWorkerLogWriter(workDir)
 
 	log := logger.Log(ctx)
 	log.Info("cleaning up clear-destination for job", "jobID", req.JobID)
+	keepPaused := req.StartSyncAfterClear
 
 	if err := a.executor.CleanupAndPersistState(ctx, req); err != nil {
 		return err
@@ -276,8 +266,13 @@ func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRe
 				TaskQueue: taskQueue,
 			}
 
-			if input.Description.Schedule.State != nil {
-				input.Description.Schedule.State.Paused = false
+			if input.Description.Schedule.State == nil {
+				input.Description.Schedule.State = &client.ScheduleState{}
+			}
+			input.Description.Schedule.State.Paused = keepPaused
+			if keepPaused {
+				input.Description.Schedule.State.Note = "Table resync remains paused until successful sync handoff"
+			} else {
 				input.Description.Schedule.State.Note = "Restored to sync after clear-destination"
 			}
 
@@ -291,15 +286,15 @@ func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRe
 		return err
 	}
 
-	// Verify the schedule is actually unpaused
+	// Verify the schedule remains paused for resync, or resumes for an ordinary clear.
 	desc, err := handle.Describe(ctx)
 	if err != nil {
 		log.Error("failed to describe schedule after update", "jobID", req.JobID, "scheduleID", scheduleID, "error", err)
 		return err
 	}
-	if desc.Schedule.State.Paused {
-		log.Error("schedule still paused after update", "jobID", req.JobID, "scheduleID", scheduleID)
-		return fmt.Errorf("schedule %s, jobID: %d still paused after update", scheduleID, req.JobID)
+	if desc.Schedule.State == nil || desc.Schedule.State.Paused != keepPaused {
+		log.Error("unexpected schedule pause state after update", "jobID", req.JobID, "scheduleID", scheduleID, "expectedPaused", keepPaused)
+		return fmt.Errorf("schedule %s, jobID: %d expected paused=%t after update", scheduleID, req.JobID, keepPaused)
 	}
 
 	log.Info("successfully updated schedule (clear-destination to sync)", "jobID", req.JobID, "scheduleID", scheduleID)

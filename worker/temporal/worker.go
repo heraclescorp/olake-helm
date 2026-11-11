@@ -46,6 +46,7 @@ func NewWorker(ctx context.Context, t *Temporal, e *executor.AbstractExecutor, d
 	w.RegisterActivity(activitiesInstance.SyncActivity)
 	w.RegisterActivity(activitiesInstance.PostSyncActivity)
 	w.RegisterActivity(activitiesInstance.PostClearActivity)
+	w.RegisterActivity(activitiesInstance.TriggerSyncAfterClearActivity)
 	w.RegisterActivity(activitiesInstance.SendWebhookNotificationActivity)
 	w.RegisterActivity(activitiesInstance.IndicatorActivity)
 

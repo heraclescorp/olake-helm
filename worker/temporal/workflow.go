@@ -16,6 +16,7 @@ const (
 	SyncActivity                    = "SyncActivity"
 	PostSyncActivity                = "PostSyncActivity"
 	PostClearActivity               = "PostClearActivity"
+	TriggerSyncAfterClearActivity   = "TriggerSyncAfterClearActivity"
 	SendWebhookNotificationActivity = "SendWebhookNotificationActivity"
 	IndicatorActivity               = "IndicatorActivity"
 )
@@ -134,6 +135,19 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 			} else {
 				err = fmt.Errorf("cleanup failed: %s", cleanupErr)
 			}
+		}
+
+		if req.Command == types.ClearDestination && req.StartSyncAfterClear && err == nil {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				return
+			}
+			triggerCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+				StartToCloseTimeout: time.Minute,
+				WaitForCancellation: true,
+				RetryPolicy:         SyncRetryPolicy,
+			})
+			err = workflow.ExecuteActivity(triggerCtx, TriggerSyncAfterClearActivity, req).Get(triggerCtx, nil)
 		}
 	}()
 

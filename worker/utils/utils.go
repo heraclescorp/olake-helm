@@ -404,6 +404,11 @@ func RevertUpdatesInSchedule(req *types.ExecutionRequest) {
 
 	req.Command = types.Sync
 	req.Args = SetCatalogArgs(args, split)
+	if req.StartSyncAfterClear {
+		req.StartSyncAfterClear = false
+		req.TempPath = ""
+		req.Configs = nil
+	}
 }
 
 // ExtractJSONAndMarshal extracts and returns the last valid JSON block from output
