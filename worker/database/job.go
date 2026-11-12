@@ -117,7 +117,7 @@ func scanJobData(row *sql.Row) (types.JobData, error) {
 	return jobData, nil
 }
 
-func (db *DB) UpdateJobState(ctx context.Context, jobId int, state string) error {
+func (db *DB) UpdateJobState(ctx context.Context, jobId int, workflowID, state string) error {
 	log := logger.Log(ctx)
 
 	log.Info("updating job state", "jobID", jobId, "state", state)
@@ -126,16 +126,23 @@ func (db *DB) UpdateJobState(ctx context.Context, jobId int, state string) error
 	query := fmt.Sprintf(`
 			UPDATE %s
 			SET state = $1, updated_at = NOW() 
-			WHERE id = $2`,
+			WHERE id = $2 AND execution_workflow_id = $3`,
 		tableName)
 
 	cctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
-	_, err := db.client.ExecContext(cctx, query, state, jobId)
+	result, err := db.client.ExecContext(cctx, query, state, jobId, workflowID)
 	if err != nil {
 		log.Error("failed to update job state", "jobID", jobId, "error", err)
 		return fmt.Errorf("failed to update job state: %s", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrJobExecutionOwned
 	}
 
 	log.Info("successfully updated job state", "jobID", jobId, "state", state)

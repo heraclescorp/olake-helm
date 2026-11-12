@@ -34,6 +34,7 @@ type EventPayload struct {
 
 // SendEvent sends a sync-telemetry event to olake-ui.
 func SendEvent(payload EventPayload) {
+	callbackURL := viper.GetString(constants.EnvCallbackURL)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -48,9 +49,7 @@ func SendEvent(payload EventPayload) {
 			return
 		}
 
-		url := fmt.Sprintf("%s/sync-telemetry",
-			viper.GetString(constants.EnvCallbackURL),
-		)
+		url := fmt.Sprintf("%s/sync-telemetry", callbackURL)
 
 		body := map[string]interface{}{
 			"job_id":      payload.JobID,

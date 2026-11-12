@@ -23,10 +23,13 @@ import (
 type activityExecutor interface {
 	Execute(context.Context, *types.ExecutionRequest) (*types.ExecutorResponse, error)
 	CleanupAndPersistState(context.Context, *types.ExecutionRequest) error
+	CleanupResync(context.Context, *types.ExecutionRequest, bool) error
 }
 
 type activityDatabase interface {
 	GetJobData(context.Context, int) (types.JobData, error)
+	AcquireJobExecution(context.Context, int, string) error
+	ReleaseJobExecution(context.Context, int, string) error
 	CommitCatalogEnrollment(context.Context, int, types.JobData, types.EnrollmentResult) error
 	GetProjectSettingsByProjectID(context.Context, string) (*types.ProjectSettings, error)
 }
@@ -53,6 +56,11 @@ func (a *Activity) ExecuteActivity(ctx context.Context, req *types.ExecutionRequ
 	activity.RecordHeartbeat(ctx, "executing %s activity", req.Command)
 	req.HeartbeatFunc = activity.RecordHeartbeat
 
+	if req.Command == types.ClearDestination {
+		if err := a.acquireJobExecution(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 	if req.Command == types.ClearDestination {
 		jobDetails, err := a.db.GetJobData(ctx, req.JobID)
 		if err != nil {
@@ -91,6 +99,9 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 	activity.RecordHeartbeat(ctx, "executing sync for job %d", req.JobID)
 	req.HeartbeatFunc = activity.RecordHeartbeat
 
+	if err := a.acquireJobExecution(ctx, req); err != nil {
+		return nil, err
+	}
 	// Update the configs with latest
 	jobDetails, err := a.db.GetJobData(ctx, req.JobID)
 	if err != nil {
@@ -235,15 +246,13 @@ func (a *Activity) PostSyncActivity(ctx context.Context, req *types.ExecutionReq
 	return nil
 }
 
-// Ordinary clears resume their schedule after cleanup. Table resync restores the sync
-// action while paused; its successful follow-up patch unpauses and triggers together.
+// Ordinary clears restore and resume sync after cleanup.
 func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRequest) error {
 	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 	defer utils.ReleaseWorkerLogWriter(workDir)
 
 	log := logger.Log(ctx)
 	log.Info("cleaning up clear-destination for job", "jobID", req.JobID)
-	keepPaused := req.StartSyncAfterClear
 
 	if err := a.executor.CleanupAndPersistState(ctx, req); err != nil {
 		return err
@@ -269,12 +278,8 @@ func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRe
 			if input.Description.Schedule.State == nil {
 				input.Description.Schedule.State = &client.ScheduleState{}
 			}
-			input.Description.Schedule.State.Paused = keepPaused
-			if keepPaused {
-				input.Description.Schedule.State.Note = "Table resync remains paused until successful sync handoff"
-			} else {
-				input.Description.Schedule.State.Note = "Restored to sync after clear-destination"
-			}
+			input.Description.Schedule.State.Paused = false
+			input.Description.Schedule.State.Note = "Restored to sync after clear-destination"
 
 			return &client.ScheduleUpdate{
 				Schedule: &input.Description.Schedule,
@@ -286,15 +291,15 @@ func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRe
 		return err
 	}
 
-	// Verify the schedule remains paused for resync, or resumes for an ordinary clear.
+	// Verify the ordinary sync schedule resumed.
 	desc, err := handle.Describe(ctx)
 	if err != nil {
 		log.Error("failed to describe schedule after update", "jobID", req.JobID, "scheduleID", scheduleID, "error", err)
 		return err
 	}
-	if desc.Schedule.State == nil || desc.Schedule.State.Paused != keepPaused {
-		log.Error("unexpected schedule pause state after update", "jobID", req.JobID, "scheduleID", scheduleID, "expectedPaused", keepPaused)
-		return fmt.Errorf("schedule %s, jobID: %d expected paused=%t after update", scheduleID, req.JobID, keepPaused)
+	if desc.Schedule.State == nil || desc.Schedule.State.Paused {
+		log.Error("schedule still paused after update", "jobID", req.JobID, "scheduleID", scheduleID)
+		return fmt.Errorf("schedule %s, jobID: %d still paused after clear-destination", scheduleID, req.JobID)
 	}
 
 	log.Info("successfully updated schedule (clear-destination to sync)", "jobID", req.JobID, "scheduleID", scheduleID)

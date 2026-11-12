@@ -58,6 +58,12 @@ const (
 	StreamsFile          = "streams.json"
 	AvailableStreamsFile = "available_streams.json"
 	SelectedStreamsFile  = "selected_streams.json"
+	ResyncNamespaceFlag  = "--resync-namespace"
+	ResyncTableFlag      = "--resync-table"
+	ResyncIDFlag         = "--resync-id"
+	ResyncResultFile     = "resync-result.json"
+	ResyncFailureFile    = "resync-failure.json"
+	ResyncExecutionFile  = "resync-execution.json"
 	// EnrollmentGateFile distinguishes a failed metadata preflight from a sync
 	// whose connector launched and must persist its state during cleanup.
 	EnrollmentGateFile = "auto-enrollment-gate.json"
@@ -105,5 +111,5 @@ var (
 		500 << 10, // 500 KiB
 		1 << 20,   // 1 MiB
 	}
-	AsyncCommands = []types.Command{types.Sync, types.ClearDestination}
+	AsyncCommands = []types.Command{types.Sync, types.ClearDestination, types.Resync}
 )

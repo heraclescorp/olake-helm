@@ -15,8 +15,11 @@ const (
 	ExecuteActivity                 = "ExecuteActivity"
 	SyncActivity                    = "SyncActivity"
 	PostSyncActivity                = "PostSyncActivity"
+	ResyncActivity                  = "ResyncActivity"
+	PostResyncActivity              = "PostResyncActivity"
+	ReleaseJobExecutionActivity     = "ReleaseJobExecutionActivity"
+	TriggerSyncAfterResyncActivity  = "TriggerSyncAfterResyncActivity"
 	PostClearActivity               = "PostClearActivity"
-	TriggerSyncAfterClearActivity   = "TriggerSyncAfterClearActivity"
 	SendWebhookNotificationActivity = "SendWebhookNotificationActivity"
 	IndicatorActivity               = "IndicatorActivity"
 )
@@ -67,6 +70,7 @@ func ExecuteWorkflow(ctx workflow.Context, req *types.ExecutionRequest) (*types.
 // Supported Commands:
 //   - Sync: Performs data replication from source to destination
 //   - ClearDestination: Clears data from the destination
+//   - Resync: Atomically replaces one table without destructive clear
 //
 // Features:
 //   - Infinite retries (MaximumAttempts: 0) with exponential backoff for transient errors
@@ -99,6 +103,8 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 		activity, cleanupActivity = SyncActivity, PostSyncActivity
 	case types.ClearDestination:
 		activity, cleanupActivity = ExecuteActivity, PostClearActivity
+	case types.Resync:
+		activity, cleanupActivity = ResyncActivity, PostResyncActivity
 	default:
 		return nil, fmt.Errorf("invalid command: %s", req.Command)
 	}
@@ -113,10 +119,12 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 		newCtx = workflow.WithActivityOptions(newCtx, cleanupOtions)
 
 		var cleanupErr error
-		if req.Command == types.Sync {
+		if req.Command == types.Sync || req.Command == types.Resync {
 			// err is the named return above - only this workflow sees it.
 			var status syncStatus
 			switch {
+			case req.Command == types.Resync && ctx.Err() != nil:
+				status = syncStatusCancelled
 			case err == nil:
 				status = syncStatusSuccess
 			case temporal.IsCanceledError(err):
@@ -136,8 +144,17 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 				err = fmt.Errorf("cleanup failed: %s", cleanupErr)
 			}
 		}
-
-		if req.Command == types.ClearDestination && req.StartSyncAfterClear && err == nil {
+		if cleanupErr == nil {
+			releaseErr := workflow.ExecuteActivity(newCtx, ReleaseJobExecutionActivity, req).Get(newCtx, nil)
+			if releaseErr != nil {
+				if err != nil {
+					err = fmt.Errorf("execution failed: %s, ownership release also failed: %s", err, releaseErr)
+				} else {
+					err = fmt.Errorf("ownership release failed: %s", releaseErr)
+				}
+			}
+		}
+		if req.Command == types.Resync && err == nil {
 			if ctx.Err() != nil {
 				err = ctx.Err()
 				return
@@ -147,8 +164,9 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 				WaitForCancellation: true,
 				RetryPolicy:         SyncRetryPolicy,
 			})
-			err = workflow.ExecuteActivity(triggerCtx, TriggerSyncAfterClearActivity, req).Get(triggerCtx, nil)
+			err = workflow.ExecuteActivity(triggerCtx, TriggerSyncAfterResyncActivity, req).Get(triggerCtx, nil)
 		}
+
 	}()
 
 	// set search attributes to differentiate between sync and clear operation

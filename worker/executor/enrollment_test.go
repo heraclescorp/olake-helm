@@ -20,7 +20,7 @@ type enrollmentStateStore struct {
 	state string
 }
 
-func (db *enrollmentStateStore) UpdateJobState(_ context.Context, _ int, state string) error {
+func (db *enrollmentStateStore) UpdateJobState(_ context.Context, _ int, _ string, state string) error {
 	db.state = state
 	return nil
 }

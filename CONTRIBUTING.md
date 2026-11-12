@@ -118,3 +118,18 @@ helm template olake helm/olake -f my-values.yaml
 ```
 
 For template or behavior changes, install the chart on a local cluster (kind, minikube or k3d) and describe what you checked in the pull request.
+
+### Atomic table resync worker
+
+Deploy the UI database migration (`execution_workflow_id`, nullable text) before the worker. Deploy a connector with the dedicated `resync` command and the new worker before enabling the UI resync entry point. Older connectors fail closed; there is no fallback to destructive `clear-destination`.
+
+Pause all job schedules and drain every pre-upgrade sync/clear/table-resync workflow and its connector resources before replacing the worker. Ownership release is now a separately recorded activity after successful cleanup for every long-running command, so this unversioned workflow code must not replay or reset pre-upgrade histories. Use the old worker version if an old history needs recovery. The obsolete clear-to-sync handoff is removed. Enable new resync requests only after migration, worker and connector rollout is complete.
+
+Resync loads the full saved source, destination, catalog and state. Its `--resync-namespace`, `--resync-table` and `--resync-id` identify one target and a stable Temporal workflow ID. Automatic enrollment does not run. State is persisted only after successful execution, resource termination and a matching `resync-result.json` publication receipt, including the SHA-256 of the final JSON-object state (decoded with `UseNumber`, then marshaled).
+
+Failure leaves the normal sync schedule paused. A confirmed `resync-failure.json` with `publication: "not_published"` permits ownership release after cleanup; missing, stale or `in_progress` evidence retains the durable owner. For an unknown publication outcome, reset/retry that **same Temporal workflow ID** to reconcile the destination marker and checkpoint. Do not clear ownership manually or start a replacement operation while a connector may survive. Only confirmed success restores and resumes normal sync with an idempotent schedule patch.
+
+Errors after claiming ownership but before the first executor invocation record matching unpublished evidence, including database-read, advanced-settings and storage-version validation failures. A durable workflow-local `resync-execution.json` marker prevents a later preflight error from overwriting an earlier execution's unknown publication outcome. Before invocation, the worker acknowledges both this marker and `in_progress` evidence; proof-write failures retain ownership.
+
+Worker behavior checks: `cd worker && go test ./utils ./executor ./executor/docker ./executor/kubernetes ./temporal ./database`. Set `OLAKE_ENROLLMENT_TEST_DSN` to an isolated localhost PostgreSQL URL to exercise durable ownership and stale-cleanup fencing; the database test creates and removes its own schema.
+

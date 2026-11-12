@@ -11,13 +11,11 @@ import (
 	"google.golang.org/grpc"
 )
 
-func resyncWorkflowArgs(startSync bool) map[string]interface{} {
+func clearWorkflowArgs() map[string]interface{} {
 	return map[string]interface{}{
-		"command":                string(types.ClearDestination),
-		"project_id":             "123",
-		"job_id":                 42,
-		"temp_path":              "table-resync/state.json",
-		"start_sync_after_clear": startSync,
+		"command":    string(types.ClearDestination),
+		"project_id": "123",
+		"job_id":     42,
 	}
 }
 
@@ -44,10 +42,10 @@ func (c *resyncTemporalClient) ScheduleClient() client.ScheduleClient {
 	return c.schedules
 }
 
-func TestCancelledClearFollowupDoesNotSendPatch(t *testing.T) {
+func TestCancelledResyncFollowupDoesNotSendPatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	activities := &Activity{}
-	err := activities.TriggerSyncAfterClearActivity(ctx, &types.ExecutionRequest{StartSyncAfterClear: true})
+	err := activities.TriggerSyncAfterResyncActivity(ctx, &types.ExecutionRequest{Command: types.Resync})
 	require.ErrorIs(t, err, context.Canceled)
 }

@@ -29,7 +29,7 @@ type FailureIndicator interface {
 }
 
 type jobStateStore interface {
-	UpdateJobState(context.Context, int, string) error
+	UpdateJobState(context.Context, int, string, string) error
 }
 
 type AbstractExecutor struct {
@@ -116,6 +116,9 @@ func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequ
 
 // CleanupAndPersistState stops the container/pod and saves the state file in the database
 func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *types.ExecutionRequest) error {
+	if req.Command == types.Resync {
+		return fmt.Errorf("resync state requires confirmed publication and successful execution")
+	}
 	log := logger.Log(ctx)
 
 	var gateErr error
@@ -141,7 +144,7 @@ func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *type
 		return err
 	}
 
-	if err := a.db.UpdateJobState(ctx, req.JobID, stateFile); err != nil {
+	if err := a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, stateFile); err != nil {
 		log.Error("failed to update job state in database", "jobID", req.JobID, "error", err)
 		return err
 	}

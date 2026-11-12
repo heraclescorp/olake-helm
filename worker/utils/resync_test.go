@@ -16,10 +16,9 @@ func TestTableResyncRestoresFullSavedCatalog(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			req := &types.ExecutionRequest{
-				Command:             types.ClearDestination,
-				StartSyncAfterClear: true,
-				TempPath:            "table-resync/state.json",
-				Args:                []string{"clear-destination", "--state", "/mnt/config/state.json", "--destination", "/mnt/config/destination.json"},
+				Command:  types.Resync,
+				TempPath: "table-resync/state.json",
+				Args:     []string{"resync", "--state", "/mnt/config/state.json", "--destination", "/mnt/config/destination.json"},
 				Configs: []types.JobConfig{
 					{Name: constants.StreamsFile, Data: `{"streams":[{"name":"reset"}]}`},
 					{Name: constants.AvailableStreamsFile, Data: `{"streams":[{"name":"reset"}]}`},
@@ -44,7 +43,6 @@ func TestTableResyncRestoresFullSavedCatalog(t *testing.T) {
 
 			RevertUpdatesInSchedule(req)
 			require.Equal(t, types.Sync, req.Command)
-			require.False(t, req.StartSyncAfterClear)
 			require.Empty(t, req.TempPath)
 			require.Empty(t, req.Configs)
 			require.Equal(t, "sync", req.Args[0])
@@ -79,7 +77,5 @@ func TestOrdinaryClearRequestKeepsExistingBehavior(t *testing.T) {
 	RevertUpdatesInSchedule(req)
 	require.Equal(t, types.Sync, req.Command)
 	require.Equal(t, "ordinary-clear/state.json", req.TempPath)
-	require.False(t, req.StartSyncAfterClear)
 	require.Equal(t, []types.JobConfig{{Name: "state.json", Data: `{"keep":true}`}}, req.Configs)
 }
-

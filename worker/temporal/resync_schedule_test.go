@@ -29,6 +29,10 @@ func (e *resyncCleanupExecutor) CleanupAndPersistState(context.Context, *types.E
 	return e.cleanup()
 }
 
+func (e *resyncCleanupExecutor) CleanupResync(context.Context, *types.ExecutionRequest, bool) error {
+	return e.cleanup()
+}
+
 type resyncScheduleHandle struct {
 	client.ScheduleHandle
 	mu                sync.Mutex
@@ -107,119 +111,51 @@ func (c *resyncScheduleClient) GetHandle(context.Context, string) client.Schedul
 }
 
 func TestClearWorkflowObservableScheduleSafety(t *testing.T) {
-	clearFailed := temporal.NewNonRetryableApplicationError("clear failed", "clear", nil)
-	cleanupFailed := temporal.NewNonRetryableApplicationError("state persistence failed", "cleanup", nil)
+	terminal := temporal.NewNonRetryableApplicationError("clear failed", "clear", nil)
 	for _, tc := range []struct {
-		name                string
-		resync              bool
-		executeErr          error
-		cleanupErr          error
-		cancelDuringClear   bool
-		cancelDuringCleanup bool
-		transientCleanup    bool
-		restoreErr          error
-		patchErr            error
-		loseFirstAck        bool
-		wantPaused          bool
-		wantTriggers        int
-		wantError           bool
+		name       string
+		executeErr error
+		cleanupErr error
+		cancel     bool
 	}{
-		{name: "resync success", resync: true, wantTriggers: 1},
-		{name: "resync retries cleanup", resync: true, transientCleanup: true, wantTriggers: 1},
-		{name: "resync lost handoff acknowledgement", resync: true, loseFirstAck: true, wantTriggers: 1},
-		{name: "resync restore failure", resync: true, restoreErr: cleanupFailed, wantPaused: true, wantError: true},
-		{name: "resync handoff failure", resync: true, patchErr: clearFailed, wantPaused: true, wantError: true},
-		{name: "resync clear failure", resync: true, executeErr: clearFailed, wantPaused: true, wantError: true},
-		{name: "resync clear cancellation", resync: true, cancelDuringClear: true, wantPaused: true, wantError: true},
-		{name: "resync cleanup cancellation", resync: true, cancelDuringCleanup: true, wantPaused: true, wantError: true},
-		{name: "resync cleanup failure", resync: true, cleanupErr: cleanupFailed, wantPaused: true, wantError: true},
 		{name: "ordinary clear success"},
-		{name: "ordinary clear failure", executeErr: clearFailed, wantError: true},
-		{name: "ordinary clear cancellation", cancelDuringClear: true, wantError: true},
-		{name: "ordinary clear cleanup failure", cleanupErr: cleanupFailed, wantPaused: true, wantError: true},
+		{name: "ordinary clear failure", executeErr: terminal},
+		{name: "ordinary clear cancellation", cancel: true},
+		{name: "ordinary clear cleanup failure", cleanupErr: terminal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var suite testsuite.WorkflowTestSuite
 			env := suite.NewTestWorkflowEnvironment()
 			spec := &client.ScheduleSpec{CronExpressions: []string{"0 * * * *"}}
 			policy := &client.SchedulePolicies{Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP}
-			handle := &resyncScheduleHandle{updateErr: tc.restoreErr, patchErr: tc.patchErr, loseFirstAck: tc.loseFirstAck, schedule: client.Schedule{
-				Spec:   spec,
-				Policy: policy,
-				State:  &client.ScheduleState{Paused: true},
-				Action: &client.ScheduleWorkflowAction{Args: []interface{}{&types.ExecutionRequest{Command: types.ClearDestination}}},
-			}}
-			cleanupAttempts := 0
-			persisted := false
-			activities := &Activity{
-				executor: &resyncCleanupExecutor{cleanup: func() error {
-					cleanupAttempts++
-					if tc.transientCleanup && cleanupAttempts == 1 {
-						return serviceerror.NewUnavailable("state database unavailable")
-					}
-					if tc.cancelDuringCleanup {
-						env.CancelWorkflow()
-					}
-					persisted = tc.cleanupErr == nil
-					return tc.cleanupErr
-				}},
-				tempClient: &resyncTemporalClient{
-					service: &resyncServiceClient{patch: func(ctx context.Context, req *workflowservice.PatchScheduleRequest) (*workflowservice.PatchScheduleResponse, error) {
-						require.True(t, persisted)
-						return handle.patch(ctx, req)
-					}},
-					schedules: &resyncScheduleClient{handle: handle},
-				},
-			}
-			env.RegisterActivity(activities.ExecuteActivity)
-			env.RegisterActivity(activities.PostClearActivity)
-			env.RegisterActivity(activities.TriggerSyncAfterClearActivity)
-			env.RegisterActivity(activities.SendWebhookNotificationActivity)
-			clearCall := env.OnActivity(ExecuteActivity, mock.Anything, mock.Anything).
-				Return(&types.ExecutorResponse{}, tc.executeErr)
-			if tc.cancelDuringClear {
-				clearCall.After(time.Hour)
+			handle := &resyncScheduleHandle{schedule: client.Schedule{Spec: spec, Policy: policy, State: &client.ScheduleState{Paused: true}}}
+			a := &Activity{db: &enrollmentActivityDB{}, executor: &resyncCleanupExecutor{cleanup: func() error { return tc.cleanupErr }}, tempClient: &resyncTemporalClient{schedules: &resyncScheduleClient{handle: handle}}}
+			env.RegisterActivity(a.ExecuteActivity)
+			env.RegisterActivity(a.PostClearActivity)
+			env.RegisterActivity(a.ReleaseJobExecutionActivity)
+			env.RegisterActivity(a.SendWebhookNotificationActivity)
+			call := env.OnActivity(ExecuteActivity, mock.Anything, mock.Anything).Return(&types.ExecutorResponse{}, tc.executeErr)
+			if tc.cancel {
+				call.After(time.Hour)
 				env.RegisterDelayedCallback(env.CancelWorkflow, time.Second)
 			}
 			if tc.executeErr != nil {
 				env.OnActivity(SendWebhookNotificationActivity, mock.Anything, mock.Anything).Return(nil).Maybe()
 			}
-
-			env.ExecuteWorkflow(RunSyncWorkflow, resyncWorkflowArgs(tc.resync))
-			require.True(t, env.IsWorkflowCompleted())
-			if tc.wantError {
+			env.ExecuteWorkflow(RunSyncWorkflow, clearWorkflowArgs())
+			if tc.executeErr != nil || tc.cleanupErr != nil || tc.cancel {
 				require.Error(t, env.GetWorkflowError())
 			} else {
 				require.NoError(t, env.GetWorkflowError())
 			}
-			description, err := handle.Describe(context.Background())
+			desc, err := handle.Describe(context.Background())
 			require.NoError(t, err)
-			require.Equal(t, tc.wantPaused, description.Schedule.State.Paused)
-			require.Equal(t, tc.wantTriggers, handle.triggers)
-			require.Equal(t, spec, description.Schedule.Spec)
-			require.Equal(t, policy, description.Schedule.Policy)
-			if tc.cleanupErr != nil || tc.restoreErr != nil {
-				require.Empty(t, handle.pausedAfterUpdate)
-			} else {
-				require.Equal(t, []bool{tc.resync}, handle.pausedAfterUpdate)
-				action := description.Schedule.Action.(*client.ScheduleWorkflowAction)
-				restored := action.Args[0].(*types.ExecutionRequest)
-				require.Equal(t, types.Sync, restored.Command)
-				require.False(t, restored.StartSyncAfterClear)
-				if tc.resync {
-					require.Empty(t, restored.TempPath)
-					require.Empty(t, restored.Configs)
-				}
-			}
-			if tc.wantTriggers != 0 {
-				require.Equal(t, []bool{true}, handle.pausedBeforePatch)
-				require.Equal(t, []enumspb.ScheduleOverlapPolicy{enumspb.SCHEDULE_OVERLAP_POLICY_BUFFER_ONE}, handle.triggerOverlaps)
-				require.NotEmpty(t, handle.requestIDs[0])
-				for _, id := range handle.requestIDs {
-					require.Equal(t, handle.requestIDs[0], id)
-				}
-			} else {
-				require.Empty(t, handle.pausedBeforePatch)
+			require.Equal(t, tc.cleanupErr != nil, desc.Schedule.State.Paused)
+			require.Equal(t, spec, desc.Schedule.Spec)
+			require.Equal(t, policy, desc.Schedule.Policy)
+			require.Zero(t, handle.triggers)
+			if tc.cleanupErr == nil {
+				require.Equal(t, types.Sync, desc.Schedule.Action.(*client.ScheduleWorkflowAction).Args[0].(*types.ExecutionRequest).Command)
 			}
 		})
 	}

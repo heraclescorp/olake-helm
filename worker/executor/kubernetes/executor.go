@@ -13,6 +13,9 @@ import (
 	"github.com/datazip-inc/olake-helm/worker/utils/logger"
 	"github.com/spf13/viper"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -199,6 +202,17 @@ func (k *KubernetesExecutor) Cleanup(ctx context.Context, req *types.ExecutionRe
 	if err := k.cleanupPod(ctx, podName); err != nil {
 		log.Error("failed to cleanup pod", "podName", podName, "error", err)
 		return fmt.Errorf("failed to cleanup pod: %s", err)
+	}
+	if utils.IsAsyncCommand(req.Command) {
+		if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Second*constants.ContainerCleanupTimeout, true, func(ctx context.Context) (bool, error) {
+			_, err := k.client.CoreV1().Pods(k.namespace).Get(ctx, podName, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, err
+		}); err != nil {
+			return fmt.Errorf("resync pod termination is unconfirmed: %w", err)
+		}
 	}
 
 	log.Info("pod cleanup completed", "podName", podName)

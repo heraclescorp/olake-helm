@@ -390,10 +390,10 @@ func ConnectorConfigDir(command types.Command, workflowID string) string {
 	return fmt.Sprintf("s3://%s/%s", bucket, key)
 }
 
-// RevertUpdatesInSchedule reverts the updates made to the schedule for clear-destination request.
-// The catalog flags only keep the stored args well-formed: SyncActivity resets them from the
-// job's catalog format on every run.
+// RevertUpdatesInSchedule restores the ordinary sync action after maintenance.
+// SyncActivity reloads the authoritative catalog and state on every run.
 func RevertUpdatesInSchedule(req *types.ExecutionRequest) {
+	resync := req.Command == types.Resync
 	split := slices.Contains(req.Args, constants.AvailableStreamsFlag)
 	args := []string{
 		"sync",
@@ -404,8 +404,7 @@ func RevertUpdatesInSchedule(req *types.ExecutionRequest) {
 
 	req.Command = types.Sync
 	req.Args = SetCatalogArgs(args, split)
-	if req.StartSyncAfterClear {
-		req.StartSyncAfterClear = false
+	if resync {
 		req.TempPath = ""
 		req.Configs = nil
 	}
@@ -513,7 +512,7 @@ func PrepareWorkflowLogger(ctx context.Context, workflowID string, command types
 	}
 }
 
-// IsAsyncCommand returns true if the command is an asynchronous command(sync, clear-destination)
+// IsAsyncCommand reports whether the command has a long-running job lifecycle.
 func IsAsyncCommand(command types.Command) bool {
 	return slices.Contains(constants.AsyncCommands, command)
 }

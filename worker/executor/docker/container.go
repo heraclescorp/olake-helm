@@ -186,7 +186,7 @@ func (d *DockerExecutor) getContainerState(ctx context.Context, name, workflowID
 
 	running := inspect.Container.State.Running
 	var ec *int
-	if !running && inspect.Container.State.ExitCode != 0 {
+	if !running && (inspect.Container.State.ExitCode != 0 || inspect.Container.State.Status == "exited") {
 		code := inspect.Container.State.ExitCode
 		ec = &code
 	}
@@ -207,8 +207,14 @@ func (d *DockerExecutor) StopContainer(ctx context.Context, workflowID string) e
 	// Graceful stop with timeout
 	timeout := constants.ContainerStopTimeout
 	if _, err := d.client.ContainerStop(ctx, containerName, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
 		log.Warn("docker stop failed, attempting kill", "workflowID", workflowID, "containerName", containerName, "error", err)
 		if _, kerr := d.client.ContainerKill(ctx, containerName, client.ContainerKillOptions{Signal: "SIGKILL"}); kerr != nil {
+			if errdefs.IsNotFound(kerr) {
+				return nil
+			}
 			log.Error("docker kill failed", "workflowID", workflowID, "containerName", containerName, "error", kerr)
 			return fmt.Errorf("docker kill failed: %s", kerr)
 		}
@@ -216,6 +222,9 @@ func (d *DockerExecutor) StopContainer(ctx context.Context, workflowID string) e
 
 	// Remove container
 	if _, err := d.client.ContainerRemove(ctx, containerName, client.ContainerRemoveOptions{Force: true}); err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
 		log.Error("docker rm failed", "workflowID", workflowID, "containerName", containerName, "error", err)
 		return fmt.Errorf("workflowID %s: docker rm failed for %s: %s", workflowID, containerName, err)
 	}
@@ -352,6 +361,11 @@ func (d *DockerExecutor) shouldStartOperation(ctx context.Context, req *types.Ex
 		return nil, err
 	}
 	if !alreadyLaunched {
+		return &types.Result{OK: true}, nil
+	}
+	if req.Command == types.Resync {
+		// Re-enter the same operation so the connector can reconcile its durable
+		// publication marker; old logs alone never prove successful publication.
 		return &types.Result{OK: true}, nil
 	}
 

@@ -17,7 +17,7 @@ type resyncStateStore struct {
 	err   error
 }
 
-func (db *resyncStateStore) UpdateJobState(_ context.Context, _ int, state string) error {
+func (db *resyncStateStore) UpdateJobState(_ context.Context, _ int, _ string, state string) error {
 	if db.err != nil {
 		return db.err
 	}
@@ -30,7 +30,6 @@ func TestScopedClearPersistsCompleteStateOnlyAfterCleanup(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			req, dir := executorEnrollmentFixture(t)
 			req.Command = types.ClearDestination
-			req.StartSyncAfterClear = true
 			ctx := context.Background()
 			saved := `{"global":{"lsn":"keep-global-lsn"},"streams":{"public.target":{"cursor":"old"},"public.other":{"cursor":"keep-other"}}}`
 			cleared := `{"global":{"lsn":"keep-global-lsn"},"streams":{"public.target":{"cursor":"cleared"},"public.other":{"cursor":"keep-other"}}}`

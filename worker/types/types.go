@@ -15,6 +15,7 @@ const (
 	Spec              Command = "spec"
 	Check             Command = "check"
 	Sync              Command = "sync"
+	Resync            Command = "resync"
 	ClearDestination  Command = "clear-destination"
 )
 
