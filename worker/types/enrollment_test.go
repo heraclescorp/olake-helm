@@ -80,6 +80,38 @@ func TestEnrollmentAddsOnlyDeclaredNewStreamsAndPreservesState(t *testing.T) {
 	}
 }
 
+func TestEnrollmentDropRemovedColumnsMustMatchPolicy(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		for _, policyValue := range []string{"", "false", "true"} {
+			for _, selectedValue := range []string{"", "false", "true", `"true"`, "null"} {
+				name := map[bool]string{false: "legacy", true: "split"}[split] + "/policy=" + policyValue + "/selection=" + selectedValue
+				t.Run(name, func(t *testing.T) {
+					job, result := enrollmentFixture(split)
+					if policyValue != "" {
+						job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"sync_new_columns":false`, `"sync_new_columns":false,"drop_removed_columns":`+policyValue, 1)
+					}
+					selection := &result.Streams
+					if split {
+						selection = &result.SelectedStreams
+					}
+					if selectedValue != "" {
+						newSelection := strings.Replace(enrollmentNewSelection, `"stream_name":"new"`, `"stream_name":"new","drop_removed_columns":`+selectedValue, 1)
+						*selection = strings.Replace(*selection, enrollmentNewSelection, newSelection, 1)
+					}
+					proposed, err := job.ValidateEnrollment(result)
+					if selectedValue == `"true"` || selectedValue == "null" || (policyValue == "true") != (selectedValue == "true") {
+						require.Error(t, err)
+						return
+					}
+					require.NoError(t, err)
+					require.Equal(t, job.State, proposed.State)
+					require.JSONEq(t, job.AdvancedSettings, strings.Replace(proposed.AdvancedSettings, `"index_required":true`, `"index_required":false`, 1))
+				})
+			}
+		}
+	}
+}
+
 func TestEnrollmentRejectsCatalogEditsAndUndeclaredSelections(t *testing.T) {
 	for _, split := range []bool{false, true} {
 		for _, mutation := range []string{"edit definition", "delete known", "enable excluded", "edit selection", "change root", "wrong schema", "wrong defaults", "extra empty schema", "empty proposal changes", "format switch", "duplicate enrolled"} {
