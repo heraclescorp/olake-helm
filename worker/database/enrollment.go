@@ -18,7 +18,8 @@ const catalogEditFenceQuery = `SELECT pg_advisory_xact_lock(hashtextextended($1,
 // the job and both config rows before comparing preflight's snapshot. The UI
 // holds that fence across cancellation/clear without blocking ordinary state
 // persistence. This UPDATE never touches state/global LSN, frequency or version.
-func (db *DB) CommitCatalogEnrollment(ctx context.Context, jobID int, original types.JobData, result types.EnrollmentResult) error {
+func (db *DB) CommitCatalogEnrollment(ctx context.Context, req *types.ExecutionRequest, original types.JobData, result types.EnrollmentResult) error {
+	jobID := req.JobID
 	proposed, err := original.ValidateEnrollment(result)
 	if err != nil {
 		return err
@@ -36,6 +37,16 @@ func (db *DB) CommitCatalogEnrollment(ctx context.Context, jobID int, original t
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(cctx, catalogEditFenceQuery, fmt.Sprintf("olake:catalog-edit:%d", jobID)); err != nil {
 		return fmt.Errorf("failed to acquire catalog edit fence: %w", err)
+	}
+	if err := db.checkOwner(cctx, tx, req); err != nil {
+		return err
+	}
+	execution, err := db.readExecution(cctx, tx, jobID, req.WorkflowID)
+	if err != nil {
+		return err
+	}
+	if execution.OwnerRunID != req.RunID || execution.Phase != "unadmitted" {
+		return ErrExecutionClosed
 	}
 	current, err := scanJobData(tx.QueryRowContext(cctx, query+" FOR UPDATE OF j, s, d", jobID))
 	if err != nil {

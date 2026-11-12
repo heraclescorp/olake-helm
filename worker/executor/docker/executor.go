@@ -35,10 +35,29 @@ func NewDockerExecutor() (*DockerExecutor, error) {
 func (d *DockerExecutor) Execute(ctx context.Context, req *types.ExecutionRequest, workdir string) (string, error) {
 	log := logger.Log(ctx)
 	imageName := utils.GetDockerImageName(req.ConnectorType, req.Version)
-	containerName := utils.GetWorkflowDirectory(req.Command, req.WorkflowID)
+	containerName := dockerResourceName(req)
 	log.Info("running container", "command", req.Command, "image", imageName, "containerName", containerName)
 
-	if utils.IsAsyncCommand(req.Command) {
+	controlled := utils.IsAsyncCommand(req.Command) && req.Controlled
+	if req.Command == types.Resync && !controlled {
+		return "", fmt.Errorf("resync requires a supported controlled execution domain")
+	}
+	if controlled {
+		if req.RuntimeID == "" {
+			return "", fmt.Errorf("execution outcome unknown: asynchronous Docker execution requires admitted runtime identity")
+		}
+		containerID, exists, err := d.findControlledContainer(ctx, req, containerName)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			return d.attachControlledContainer(ctx, req, containerID, workdir)
+		}
+		if !req.AllowLaunch || req.ResourceID != "" {
+			return "", fmt.Errorf("execution outcome unknown: admitted Docker resource is missing")
+		}
+	}
+	if utils.IsAsyncCommand(req.Command) && !controlled {
 		startOperation, err := d.shouldStartOperation(ctx, req, containerName, workdir)
 		if err != nil {
 			log.Error("failed to check operation status", "containerName", containerName, "error", err)
@@ -62,7 +81,11 @@ func (d *DockerExecutor) Execute(ctx context.Context, req *types.ExecutionReques
 
 	// Environment variables propagation
 	envVars := utils.GetWorkerEnvVars()
-	envVars[constants.EnvS3ConfigFolder] = utils.ConnectorConfigDir(req.Command, req.WorkflowID)
+	artifactID := req.WorkflowID
+	if controlled {
+		artifactID = req.RuntimeID
+	}
+	envVars[constants.EnvS3ConfigFolder] = utils.ConnectorConfigDir(req.Command, artifactID)
 	if indexMount != nil {
 		envVars[constants.EnvIndexDBDir] = indexMount.Target
 
@@ -85,6 +108,9 @@ func (d *DockerExecutor) Execute(ctx context.Context, req *types.ExecutionReques
 		Cmd:   req.Args,
 		Env:   envs,
 	}
+	if controlled {
+		containerConfig.Labels = dockerOwnership(req)
+	}
 
 	hostConfig := &container.HostConfig{}
 	if workdir != "" && storage.Mode() == constants.StorageModeNFS {
@@ -100,7 +126,12 @@ func (d *DockerExecutor) Execute(ctx context.Context, req *types.ExecutionReques
 
 	log.Info("creating docker container", "image", imageName, "containerName", containerName, "command", req.Args)
 
-	containerID, err := d.getOrCreateContainer(ctx, containerConfig, hostConfig, containerName)
+	var containerID string
+	if controlled {
+		containerID, err = d.createControlledContainer(ctx, req, containerConfig, hostConfig, containerName)
+	} else {
+		containerID, err = d.getOrCreateContainer(ctx, containerConfig, hostConfig, containerName)
+	}
 	if err != nil {
 		log.Error("failed to create container", "containerName", containerName, "error", err)
 		return "", err
@@ -117,11 +148,12 @@ func (d *DockerExecutor) Execute(ctx context.Context, req *types.ExecutionReques
 		}()
 	}
 
-	if err := d.startContainer(ctx, containerID); err != nil {
-		log.Error("failed to start container", "containerID", containerID, "error", err)
-		return "", err
+	if !controlled {
+		if err := d.startContainer(ctx, containerID); err != nil {
+			log.Error("failed to start container", "containerID", containerID, "error", err)
+			return "", err
+		}
 	}
-
 	if storage.Mode() == constants.StorageModeS3 {
 		// Stream connector logs to S3 while the container runs; Release later stops it with a final catch-up and flush.
 		err := utils.AcquireConnectorLogCollector(ctx, workdir, func() (*utils.ConnectorLogCollector, error) {
@@ -196,10 +228,17 @@ func (d *DockerExecutor) Cleanup(ctx context.Context, req *types.ExecutionReques
 	log := logger.Log(ctx)
 	log.Info("stopping container for cleanup", "workflowID", req.WorkflowID)
 
-	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
+	_, workDir := utils.GetExecutionDirAndSubDir(req)
 	utils.ReleaseConnectorLogCollector(workDir)
 
-	if err := d.StopContainer(ctx, req.WorkflowID); err != nil {
+	if utils.IsAsyncCommand(req.Command) && req.Controlled {
+		if req.RuntimeID == "" {
+			return fmt.Errorf("execution outcome unknown: Docker cleanup requires admitted runtime identity")
+		}
+		if err := d.cleanupControlledContainer(ctx, req); err != nil {
+			return err
+		}
+	} else if err := d.StopContainer(ctx, req.WorkflowID); err != nil {
 		log.Error("failed to stop container", "workflowID", req.WorkflowID, "error", err)
 		return fmt.Errorf("failed to stop container: %s", err)
 	}

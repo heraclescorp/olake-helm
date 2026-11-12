@@ -2,6 +2,7 @@ package kubernetes
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -15,12 +16,14 @@ import (
 	"github.com/spf13/viper"
 )
 
-func NewPodLogCollector(ctx context.Context, k *KubernetesExecutor, workflowID, workDir string) (*utils.ConnectorLogCollector, error) {
-	podName := k.sanitizeName(workflowID)
+func NewPodLogCollector(ctx context.Context, k *KubernetesExecutor, podName, podUID, workDir string) (*utils.ConnectorLogCollector, error) {
 	return utils.NewConnectorLogCollector(
 		ctx,
 		workDir,
 		func(ctx context.Context, lastLogTimestamp time.Time, follow bool) (io.Reader, error) {
+			if err := k.checkPodUID(ctx, podName, podUID); err != nil {
+				return nil, err
+			}
 			return openPodLogStream(ctx, k, podName, "connector", lastLogTimestamp, follow, false)
 		},
 		func(ctx context.Context) bool {
@@ -28,10 +31,27 @@ func NewPodLogCollector(ctx context.Context, k *KubernetesExecutor, workflowID, 
 			if err != nil {
 				return true
 			}
+			if podUID != "" && string(pod.UID) != podUID {
+				return false
+			}
 			// check if pod is still running
 			return pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
 		},
 	)
+}
+
+func (k *KubernetesExecutor) checkPodUID(ctx context.Context, podName, podUID string) error {
+	if podUID == "" {
+		return nil
+	}
+	pod, err := k.client.CoreV1().Pods(k.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if string(pod.UID) != podUID {
+		return fmt.Errorf("execution outcome unknown: Kubernetes log resource UID changed")
+	}
+	return nil
 }
 
 func RecoverWorkerLogs(ctx context.Context, k *KubernetesExecutor) error {

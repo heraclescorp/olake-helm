@@ -136,22 +136,54 @@ func (k *KubernetesExecutor) Execute(ctx context.Context, req *types.ExecutionRe
 	log := logger.Log(ctx)
 	imageName := utils.GetDockerImageName(req.ConnectorType, req.Version)
 
-	// Provision the per-job index volume before the pod that mounts it.
-	indexVolume, err := k.ensureIndexVolume(ctx, req.JobID, req.Command, req.IndexRequired, req.HeartbeatFunc)
-	if err != nil {
-		log.Error("failed to prepare index volume", "jobID", req.JobID, "command", req.Command, "error", err)
-		return "", err
+	controlled := utils.IsAsyncCommand(req.Command) && req.Controlled
+	if req.Command == types.Resync && !controlled {
+		return "", fmt.Errorf("resync requires a supported controlled execution domain")
 	}
-
-	podSpec, err := k.CreatePodSpec(req, workdir, imageName, indexVolume)
-	if err != nil {
-		return "", err
+	var pod *corev1.Pod
+	if controlled {
+		if req.RuntimeID == "" {
+			return "", fmt.Errorf("execution outcome unknown: asynchronous Kubernetes execution requires admitted runtime identity")
+		}
+		var err error
+		pod, err = k.findControlledPod(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		if pod == nil && (!req.AllowLaunch || req.ResourceID != "") {
+			return "", fmt.Errorf("execution outcome unknown: admitted Kubernetes resource is missing")
+		}
+		if pod != nil {
+			if err := validatePodAttachment(pod); err != nil {
+				return "", err
+			}
+		}
 	}
-	log.Info(fmt.Sprintf("Starting pod %s with image %s", podSpec.Name, imageName))
-
-	if _, err := k.createPod(ctx, podSpec); err != nil {
-		log.Error("failed to create pod", "podName", podSpec.Name, "error", err)
-		return "", err
+	if pod == nil {
+		// Provision the per-job index only for an actual launch, never an attach retry.
+		indexVolume, err := k.ensureIndexVolume(ctx, req.JobID, req.Command, req.IndexRequired, req.HeartbeatFunc)
+		if err != nil {
+			log.Error("failed to prepare index volume", "jobID", req.JobID, "command", req.Command, "error", err)
+			return "", err
+		}
+		podSpec, err := k.CreatePodSpec(req, workdir, imageName, indexVolume)
+		if err != nil {
+			return "", err
+		}
+		log.Info(fmt.Sprintf("Starting pod %s with image %s", podSpec.Name, imageName))
+		if controlled {
+			pod, err = k.createControlledPod(ctx, req, podSpec)
+		} else {
+			pod, err = k.createPod(ctx, podSpec)
+		}
+		if err != nil {
+			log.Error("failed to create pod", "podName", podSpec.Name, "error", err)
+			return "", err
+		}
+	}
+	podUID := ""
+	if controlled {
+		podUID = string(pod.UID)
 	}
 
 	if !utils.IsAsyncCommand(req.Command) {
@@ -160,8 +192,8 @@ func (k *KubernetesExecutor) Execute(ctx context.Context, req *types.ExecutionRe
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second*constants.ContainerCleanupTimeout)
 			defer cancel()
 
-			if err := k.cleanupPod(cleanupCtx, podSpec.Name); err != nil {
-				log.Error("failed to cleanup pod", "podName", podSpec.Name, "command", req.Command, "workflowID", req.WorkflowID, "error", err)
+			if err := k.cleanupPod(cleanupCtx, pod.Name); err != nil {
+				log.Error("failed to cleanup pod", "podName", pod.Name, "command", req.Command, "workflowID", req.WorkflowID, "error", err)
 			}
 		}()
 	}
@@ -169,22 +201,25 @@ func (k *KubernetesExecutor) Execute(ctx context.Context, req *types.ExecutionRe
 	if storage.Mode() == constants.StorageModeS3 {
 		// Stream connector logs to S3 while the pod runs; Release later stops it with a final catch-up and flush.
 		if err := utils.AcquireConnectorLogCollector(ctx, workdir, func() (*utils.ConnectorLogCollector, error) {
-			return NewPodLogCollector(ctx, k, req.WorkflowID, workdir)
+			return NewPodLogCollector(ctx, k, pod.Name, podUID, workdir)
 		}); err != nil {
 			return "", fmt.Errorf("failed to start connector log collector: %s", err)
 		}
 	}
 
-	if err := k.waitForPodCompletion(ctx, podSpec.Name, req.Timeout, req.HeartbeatFunc); err != nil {
+	if err := k.waitForPodCompletion(ctx, pod.Name, podUID, req.Timeout, req.HeartbeatFunc); err != nil {
 		if req.Command != types.Sync { // SyncActivity explains sync failures itself
-			log.Error("pod failed to complete", "podName", podSpec.Name, "error", err)
+			log.Error("pod failed to complete", "podName", pod.Name, "error", err)
 		}
 		return "", err
 	}
 
-	logs, err := k.getPodLogs(ctx, podSpec.Name, nil)
+	if err := k.checkPodUID(ctx, pod.Name, podUID); err != nil {
+		return "", err
+	}
+	logs, err := k.getPodLogs(ctx, pod.Name, nil)
 	if err != nil {
-		log.Error("failed to get pod logs", "podName", podSpec.Name, "error", err)
+		log.Error("failed to get pod logs", "podName", pod.Name, "error", err)
 		return "", fmt.Errorf("failed to get pod logs: %s", err)
 	}
 
@@ -193,11 +228,17 @@ func (k *KubernetesExecutor) Execute(ctx context.Context, req *types.ExecutionRe
 
 func (k *KubernetesExecutor) Cleanup(ctx context.Context, req *types.ExecutionRequest) error {
 	log := logger.Log(ctx)
-	podName := k.sanitizeName(req.WorkflowID)
+	podName := k.podResourceName(req)
 	log.Info("cleaning up pod", "podName", podName, "workflowID", req.WorkflowID)
 
-	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
+	_, workDir := utils.GetExecutionDirAndSubDir(req)
 	utils.ReleaseConnectorLogCollector(workDir)
+	if utils.IsAsyncCommand(req.Command) && req.Controlled {
+		if req.RuntimeID == "" {
+			return fmt.Errorf("execution outcome unknown: Kubernetes cleanup requires admitted runtime identity")
+		}
+		return k.cleanupControlledPod(ctx, req)
+	}
 
 	if err := k.cleanupPod(ctx, podName); err != nil {
 		log.Error("failed to cleanup pod", "podName", podName, "error", err)
@@ -211,7 +252,7 @@ func (k *KubernetesExecutor) Cleanup(ctx context.Context, req *types.ExecutionRe
 			}
 			return false, err
 		}); err != nil {
-			return fmt.Errorf("resync pod termination is unconfirmed: %w", err)
+			return fmt.Errorf("pod termination is unconfirmed: %w", err)
 		}
 	}
 

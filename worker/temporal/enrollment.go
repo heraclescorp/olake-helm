@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/datazip-inc/olake-helm/worker/constants"
 	"github.com/datazip-inc/olake-helm/worker/database"
@@ -68,33 +67,12 @@ func enrollmentPreflightRequest(req *types.ExecutionRequest, job types.JobData, 
 }
 
 func (a *Activity) enrollNewTables(ctx context.Context, req *types.ExecutionRequest, original types.JobData) (types.JobData, error) {
-	// Ordinary retries reuse the connector's existing config files. Enrollment
-	// must stop at the same launch boundary or it could commit a catalog that
-	// this run cannot ingest. The enrollment gate is not that boundary: it is
-	// set before provider launch, which can still fail without starting a run.
-	_, ordinaryDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
-	alreadyLaunched, err := utils.WorkflowAlreadyLaunched(ctx, ordinaryDir)
-	if err != nil {
-		return types.JobData{}, err
-	}
-	if alreadyLaunched {
-		return original, nil
-	}
-
 	policy, err := original.AutoTableEnrollment()
 	if err != nil {
 		return types.JobData{}, err
 	}
 	if policy == nil {
 		return original, nil
-	}
-	// Cancellation still needs a durable preflight-only marker so disconnected
-	// workflow cleanup cannot try to persist a nonexistent ingestion state file.
-	gateCtx, cancelGate := context.WithTimeout(context.WithoutCancel(ctx), time.Second*constants.ContainerCleanupTimeout)
-	err = utils.BeginEnrollmentPreflight(gateCtx, req)
-	cancelGate()
-	if err != nil {
-		return types.JobData{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return types.JobData{}, err
@@ -127,7 +105,7 @@ func (a *Activity) enrollNewTables(ctx context.Context, req *types.ExecutionRequ
 	if err != nil {
 		return types.JobData{}, err
 	}
-	if err := a.db.CommitCatalogEnrollment(ctx, req.JobID, original, result); err != nil {
+	if err := a.db.CommitCatalogEnrollment(ctx, req, original, result); err != nil {
 		return types.JobData{}, fmt.Errorf("automatic table enrollment catalog was not committed: %w", err)
 	}
 	if err := ctx.Err(); err != nil {

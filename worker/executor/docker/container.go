@@ -14,8 +14,6 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/datazip-inc/olake-helm/worker/constants"
-	"github.com/datazip-inc/olake-helm/worker/storage"
-	"github.com/datazip-inc/olake-helm/worker/types"
 	"github.com/datazip-inc/olake-helm/worker/utils"
 	"github.com/datazip-inc/olake-helm/worker/utils/failure"
 	"github.com/datazip-inc/olake-helm/worker/utils/logger"
@@ -193,10 +191,14 @@ func (d *DockerExecutor) getContainerState(ctx context.Context, name, workflowID
 	return ContainerState{Exists: true, Running: running, ExitCode: ec}
 }
 
-// StopContainer stops a container by name, falling back to kill if needed (for cleanup activity)
+// StopContainer preserves name-based cleanup for unmanaged executions.
 func (d *DockerExecutor) StopContainer(ctx context.Context, workflowID string) error {
+	return d.stopContainerResource(ctx, workflowID, utils.WorkflowHash(workflowID))
+}
+
+// stopContainerResource addresses an immutable ID for controlled executions.
+func (d *DockerExecutor) stopContainerResource(ctx context.Context, workflowID, containerName string) error {
 	log := logger.Log(ctx)
-	containerName := utils.WorkflowHash(workflowID)
 	log.Info("stop request received for container", "workflowID", workflowID, "containerName", containerName)
 
 	if strings.TrimSpace(containerName) == "" {
@@ -304,72 +306,4 @@ func (d *DockerExecutor) waitForContainerCompletion(ctx context.Context, contain
 			// continue
 		}
 	}
-}
-
-func (d *DockerExecutor) shouldStartOperation(ctx context.Context, req *types.ExecutionRequest, containerName, workDir string) (*types.Result, error) {
-	log := logger.Log(ctx)
-	// Inspect container state
-	state := d.getContainerState(ctx, containerName, req.WorkflowID)
-
-	// If container is running, adopt it: reattach the S3 log collector, then wait for completion.
-	// Execute must not continue for it, since ContainerStart would rerun the sync if it exits first.
-	if state.Exists && state.Running {
-		log.Info("adopting running container", "workflowID", req.WorkflowID, "containerName", containerName)
-		if storage.Mode() == constants.StorageModeS3 {
-			err := utils.AcquireConnectorLogCollector(ctx, workDir, func() (*utils.ConnectorLogCollector, error) {
-				return NewContainerLogCollector(ctx, d, containerName, workDir)
-			})
-			if err != nil {
-				return nil, fmt.Errorf("failed to start connector log collector: %s", err)
-			}
-		}
-		if err := d.waitForContainerCompletion(ctx, containerName, req.HeartbeatFunc); err != nil {
-			return nil, err
-		}
-		state = d.getContainerState(ctx, containerName, req.WorkflowID)
-	}
-
-	if state.Exists && !state.Running {
-		if err := d.flushExitedConnectorLogs(ctx, workDir, containerName); err != nil {
-			return nil, err
-		}
-	}
-
-	// If container exists and exited, treat as finished: cleanup and return status
-	if state.Exists && !state.Running && state.ExitCode != nil {
-		log.Info("container exited", "workflowID", req.WorkflowID, "containerName", containerName, "exitCode", *state.ExitCode)
-
-		if *state.ExitCode == 0 {
-			return &types.Result{OK: false, Message: "sync status: completed"}, nil
-		}
-
-		if req.Command == types.ClearDestination {
-			log.Info("removing old container for clear-destination", "workflowID", req.WorkflowID, "containerName", containerName)
-			if _, err := d.client.ContainerRemove(ctx, containerName, client.ContainerRemoveOptions{Force: true}); err != nil {
-				log.Error("failed to remove old container", "containerName", containerName, "error", err)
-				return nil, fmt.Errorf("failed to remove old container: %w", err)
-			}
-			return &types.Result{OK: true}, nil
-		}
-
-		return nil, d.containerFailure(ctx, containerName, *state.ExitCode)
-	}
-
-	// First launch path: only if we never launched and nothing is running
-	alreadyLaunched, err := utils.WorkflowAlreadyLaunched(ctx, workDir)
-	if err != nil {
-		return nil, err
-	}
-	if !alreadyLaunched {
-		return &types.Result{OK: true}, nil
-	}
-	if req.Command == types.Resync {
-		// Re-enter the same operation so the connector can reconcile its durable
-		// publication marker; old logs alone never prove successful publication.
-		return &types.Result{OK: true}, nil
-	}
-
-	// Skip if container is not running, was already launched (logs exist), and no new run is needed.
-	log.Info("container already handled, skipping launch", "workflowID", req.WorkflowID, "containerName", containerName)
-	return &types.Result{OK: false, Message: "sync status: skipped"}, nil
 }

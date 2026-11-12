@@ -32,6 +32,7 @@ type resyncTemporalClient struct {
 	client.Client
 	service   workflowservice.WorkflowServiceClient
 	schedules client.ScheduleClient
+	describe  func(context.Context, string, string) (*workflowservice.DescribeWorkflowExecutionResponse, error)
 }
 
 func (c *resyncTemporalClient) WorkflowService() workflowservice.WorkflowServiceClient {
@@ -40,6 +41,9 @@ func (c *resyncTemporalClient) WorkflowService() workflowservice.WorkflowService
 
 func (c *resyncTemporalClient) ScheduleClient() client.ScheduleClient {
 	return c.schedules
+}
+func (c *resyncTemporalClient) DescribeWorkflowExecution(ctx context.Context, id, run string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+	return c.describe(ctx, id, run)
 }
 
 func TestCancelledResyncFollowupDoesNotSendPatch(t *testing.T) {

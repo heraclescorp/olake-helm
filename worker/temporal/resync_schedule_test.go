@@ -32,6 +32,9 @@ func (e *resyncCleanupExecutor) CleanupAndPersistState(context.Context, *types.E
 func (e *resyncCleanupExecutor) CleanupResync(context.Context, *types.ExecutionRequest, bool) error {
 	return e.cleanup()
 }
+func (e *resyncCleanupExecutor) RetireExecution(context.Context, *types.ExecutionRequest) error {
+	return nil
+}
 
 type resyncScheduleHandle struct {
 	client.ScheduleHandle
@@ -46,6 +49,17 @@ type resyncScheduleHandle struct {
 	accepted          map[string]bool
 	requestIDs        []string
 	triggerOverlaps   []enumspb.ScheduleOverlapPolicy
+}
+
+func (h *resyncScheduleHandle) Pause(_ context.Context, options client.SchedulePauseOptions) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.schedule.State == nil {
+		h.schedule.State = &client.ScheduleState{}
+	}
+	h.schedule.State.Paused = true
+	h.schedule.State.Note = options.Note
+	return nil
 }
 
 func (h *resyncScheduleHandle) Update(_ context.Context, options client.ScheduleUpdateOptions) error {
@@ -134,6 +148,7 @@ func TestClearWorkflowObservableScheduleSafety(t *testing.T) {
 			env.RegisterActivity(a.PostClearActivity)
 			env.RegisterActivity(a.ReleaseJobExecutionActivity)
 			env.RegisterActivity(a.SendWebhookNotificationActivity)
+			env.OnActivity(ReleaseJobExecutionActivity, mock.Anything, mock.Anything).Return(nil).Maybe()
 			call := env.OnActivity(ExecuteActivity, mock.Anything, mock.Anything).Return(&types.ExecutorResponse{}, tc.executeErr)
 			if tc.cancel {
 				call.After(time.Hour)

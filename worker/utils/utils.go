@@ -250,16 +250,6 @@ func GetWorkflowDirectory(operation types.Command, originalWorkflowID string) st
 	}
 }
 
-func GetStateFileFromWorkdir(ctx context.Context, workflowID string, command types.Command) (string, error) {
-	_, workDir := GetWorkflowDirAndSubDir(workflowID, command)
-
-	stateFile, err := storage.ReadFile(ctx, workDir, "state.json", true)
-	if err != nil {
-		return "", fmt.Errorf("failed to read state file: %s", err)
-	}
-	return stateFile, nil
-}
-
 // GetTelemetryUserID reads the telemetry user ID from the active storage mode.
 func GetTelemetryUserID(ctx context.Context) string {
 	userID, err := storage.ReadFile(ctx, storage.ConfigDir(), constants.TelemetryUserIDPath, false)
@@ -294,36 +284,6 @@ func ValidateConnectorVersionForStorageMode(version string) error {
 		return fmt.Errorf("connector version %s does not support S3 storage mode: requires %s or later", version, constants.MinS3StorageModeVersion)
 	}
 	return nil
-}
-
-// WorkflowAlreadyLaunched reports whether this workflow has already started a connector run.
-// Config files alone do not count — they are written before the container/pod is launched.
-func WorkflowAlreadyLaunched(ctx context.Context, workdir string) (bool, error) {
-	switch storage.Mode() {
-	case constants.StorageModeS3:
-		alreadyLaunched, err := workflowConnectorLogsExistInS3(ctx, workdir)
-		if err != nil {
-			return false, err
-		}
-		return alreadyLaunched, nil
-	default:
-		logDir := filepath.Join(workdir, "logs")
-		// Comment: Check how functions error handling works here and can be improved.
-		entries, err := os.ReadDir(logDir)
-		if err != nil {
-			return false, nil
-		}
-
-		for _, entry := range entries {
-			if entry.IsDir() {
-				olakeLogPath := filepath.Join(logDir, entry.Name(), "olake.log")
-				if _, err := os.Stat(olakeLogPath); err == nil {
-					return true, nil
-				}
-			}
-		}
-		return false, nil
-	}
 }
 
 // WorkflowHash returns a deterministic hash string for a given workflowID
@@ -517,28 +477,37 @@ func IsAsyncCommand(command types.Command) bool {
 	return slices.Contains(constants.AsyncCommands, command)
 }
 
-// workflowConnectorLogsExistInS3 mirrors the NFS check for logs/sync_*/olake.log:
-// true only when connector log chunks have been uploaded for this workflow.
-// Worker retries before the first chunk is uploaded still look like a first launch.
-// List/path errors are unknown, not "never launched".
-func workflowConnectorLogsExistInS3(ctx context.Context, workDir string) (bool, error) {
-	logsPath, err := storage.S3Key(workDir, "logs", true)
-	if err != nil {
-		return false, fmt.Errorf("failed to resolve logs path: %s", err)
-	}
-
-	s3Objects, err := storage.ListS3Objects(ctx, logsPath)
-	if err != nil {
-		return false, fmt.Errorf("failed to list objects in %s: %s", logsPath, err)
-	}
-
-	for _, s3object := range s3Objects {
-		parts := strings.Split(strings.TrimPrefix(s3object.Key, logsPath), "/")
-		if len(parts) != 2 {
-			continue
+// WorkflowAlreadyLaunched preserves the historical retry boundary ONLY for
+// ordinary jobs outside the canonical atomic-resync domain. Controlled jobs
+// never use logs as launch admission or outcome authority.
+func WorkflowAlreadyLaunched(ctx context.Context, workdir string) (bool, error) {
+	if storage.Mode() == constants.StorageModeS3 {
+		logsPath, err := storage.S3Key(workdir, "logs", true)
+		if err != nil {
+			return false, err
 		}
-		if strings.HasPrefix(parts[0], constants.ConnectorLogDirPrefix) && strings.HasPrefix(parts[1], constants.PodLogFilenamePref) {
-			return true, nil
+		objects, err := storage.ListS3Objects(ctx, logsPath)
+		if err != nil {
+			return false, err
+		}
+		for _, object := range objects {
+			parts := strings.Split(strings.TrimPrefix(object.Key, logsPath), "/")
+			if len(parts) == 2 && strings.HasPrefix(parts[0], constants.ConnectorLogDirPrefix) && strings.HasPrefix(parts[1], constants.PodLogFilenamePref) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	logDir := filepath.Join(workdir, "logs")
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return false, nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if _, err := os.Stat(filepath.Join(logDir, entry.Name(), "olake.log")); err == nil {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

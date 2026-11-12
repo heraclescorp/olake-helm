@@ -24,13 +24,22 @@ type activityExecutor interface {
 	Execute(context.Context, *types.ExecutionRequest) (*types.ExecutorResponse, error)
 	CleanupAndPersistState(context.Context, *types.ExecutionRequest) error
 	CleanupResync(context.Context, *types.ExecutionRequest, bool) error
+	RetireExecution(context.Context, *types.ExecutionRequest) error
 }
 
 type activityDatabase interface {
 	GetJobData(context.Context, int) (types.JobData, error)
-	AcquireJobExecution(context.Context, int, string) error
-	ReleaseJobExecution(context.Context, int, string) error
-	CommitCatalogEnrollment(context.Context, int, types.JobData, types.EnrollmentResult) error
+	AcquireJobExecution(context.Context, *types.ExecutionRequest) error
+	ReleaseJobExecution(context.Context, *types.ExecutionRequest) error
+	GetExecution(context.Context, int, string) (*database.ExecutionRecord, error)
+	AdmitExecution(context.Context, *types.ExecutionRequest, string, string) (*database.ExecutionRecord, bool, error)
+	GuardExecution(context.Context, *types.ExecutionRequest, func(context.Context, *database.ExecutionRecord) error) error
+	CheckLaunch(context.Context, *types.ExecutionRequest) error
+	RecordExecutionResource(context.Context, *types.ExecutionRequest, string, string) error
+	AdoptExecution(context.Context, *types.ExecutionRequest, *types.ExecutionRequest) error
+	BeginHandoff(context.Context, *types.ExecutionRequest, string) error
+	ApplyHandoff(context.Context, *types.ExecutionRequest, func(context.Context, *database.ExecutionRecord) error) error
+	CommitCatalogEnrollment(context.Context, *types.ExecutionRequest, types.JobData, types.EnrollmentResult) error
 	GetProjectSettingsByProjectID(context.Context, string) (*types.ProjectSettings, error)
 }
 type Activity struct {
@@ -45,6 +54,12 @@ func NewActivity(e *executor.AbstractExecutor, db *database.DB, c *Temporal) *Ac
 }
 
 func (a *Activity) ExecuteActivity(ctx context.Context, req *types.ExecutionRequest) (*types.ExecutorResponse, error) {
+	switch req.Command {
+	case types.Sync:
+		return a.SyncActivity(ctx, req)
+	case types.Resync:
+		return a.ResyncActivity(ctx, req)
+	}
 	log := logger.Log(ctx)
 	log.Info("executing activity",
 		"command", req.Command,
@@ -59,6 +74,14 @@ func (a *Activity) ExecuteActivity(ctx context.Context, req *types.ExecutionRequ
 	if req.Command == types.ClearDestination {
 		if err := a.acquireJobExecution(ctx, req); err != nil {
 			return nil, err
+		}
+		current, err := a.db.GetExecution(ctx, req.JobID, req.WorkflowID)
+		if err != nil {
+			return nil, err
+		}
+		req.Controlled = current.Controlled
+		if current.Phase == "closed" && current.Outcome == "retired" {
+			return nil, temporal.NewNonRetryableApplicationError("prior execution safely retired; start a fresh sync or resync operation", "PriorExecutionRetired", nil)
 		}
 	}
 	if req.Command == types.ClearDestination {
@@ -87,6 +110,11 @@ func (a *Activity) ExecuteActivity(ctx context.Context, req *types.ExecutionRequ
 	if err := utils.ValidateConnectorVersionForStorageMode(req.Version); err != nil {
 		return nil, temporal.NewNonRetryableApplicationError(err.Error(), "UnsupportedConnectorVersion", err)
 	}
+	if req.Command == types.ClearDestination {
+		if err := a.prepareExecution(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 
 	return a.executor.Execute(ctx, req)
 }
@@ -101,6 +129,14 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 
 	if err := a.acquireJobExecution(ctx, req); err != nil {
 		return nil, err
+	}
+	currentExecution, err := a.db.GetExecution(ctx, req.JobID, req.WorkflowID)
+	if err != nil {
+		return nil, err
+	}
+	req.Controlled = currentExecution.Controlled
+	if currentExecution.Phase == "closed" && currentExecution.Outcome == "retired" {
+		return nil, temporal.NewNonRetryableApplicationError("prior execution safely retired; start a fresh sync or resync operation", "PriorExecutionRetired", nil)
 	}
 	// Update the configs with latest
 	jobDetails, err := a.db.GetJobData(ctx, req.JobID)
@@ -117,7 +153,9 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 	}
 	// Metadata-only discovery must durably commit additions before any ingestion
 	// config is built. Opted-out jobs never execute or read a preflight result.
-	jobDetails, err = a.enrollNewTables(ctx, req, jobDetails)
+	if currentExecution.Phase == "unadmitted" {
+		jobDetails, err = a.enrollNewTables(ctx, req, jobDetails)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, temporal.NewCanceledError("automatic table enrollment cancelled")
@@ -159,6 +197,9 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 	if err := utils.ValidateConnectorVersionForStorageMode(req.Version); err != nil {
 		telemetry.TrackSyncEvent(payload, telemetry.TelemetryEventFailed, "")
 		return nil, temporal.NewNonRetryableApplicationError(err.Error(), "UnsupportedConnectorVersion", err)
+	}
+	if err := a.prepareExecution(ctx, req); err != nil {
+		return nil, err
 	}
 
 	result, err := a.executor.Execute(ctx, req)
@@ -227,6 +268,7 @@ func (a *Activity) PostSyncActivity(ctx context.Context, req *types.ExecutionReq
 	req.Version = jobDetails.Version
 
 	if err := a.executor.CleanupAndPersistState(ctx, req); err != nil {
+		err = a.pauseAfterCleanupFailure(ctx, req, err)
 		return temporal.NewNonRetryableApplicationError(err.Error(), "cleanup failed", err)
 	}
 
@@ -255,7 +297,7 @@ func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRe
 	log.Info("cleaning up clear-destination for job", "jobID", req.JobID)
 
 	if err := a.executor.CleanupAndPersistState(ctx, req); err != nil {
-		return err
+		return a.pauseAfterCleanupFailure(ctx, req, err)
 	}
 
 	utils.RevertUpdatesInSchedule(req)
@@ -340,4 +382,18 @@ func (a *Activity) IndicatorActivity(ctx context.Context, req types.IndicatorReq
 	log := logger.Log(ctx)
 	log.Info("gitops indicator", "action", req.Action, "name", req.Name, "kind", req.Kind)
 	return a.indicator.Indicator(ctx, &req)
+}
+
+func (a *Activity) pauseAfterCleanupFailure(ctx context.Context, req *types.ExecutionRequest, cause error) error {
+	if !req.Controlled {
+		return cause
+	}
+	pauseErr := a.db.GuardExecution(ctx, req, func(ctx context.Context, _ *database.ExecutionRecord) error {
+		_, scheduleID := utils.SyncWorkflowAndScheduleID(req.ProjectID, req.JobID)
+		return a.tempClient.ScheduleClient().GetHandle(ctx, scheduleID).Pause(ctx, client.SchedulePauseOptions{Note: "Execution outcome or cleanup is unconfirmed; ownership retained for reconciliation"})
+	})
+	if pauseErr != nil {
+		return fmt.Errorf("%w; retain ownership; cannot confirm schedule pause: %v", cause, pauseErr)
+	}
+	return cause
 }

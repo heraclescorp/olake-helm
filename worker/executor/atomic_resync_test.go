@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/datazip-inc/olake-helm/worker/constants"
+	"github.com/datazip-inc/olake-helm/worker/database"
 	"github.com/datazip-inc/olake-helm/worker/storage"
 	"github.com/datazip-inc/olake-helm/worker/types"
 	"github.com/stretchr/testify/require"
@@ -32,11 +33,11 @@ func publicationForState(t *testing.T, req *types.ExecutionRequest, state string
 	canonical, err := json.Marshal(object)
 	require.NoError(t, err)
 	digest := sha256.Sum256(canonical)
-	return resyncPublication{Version: 1, ResyncID: req.WorkflowID, Namespace: "public", StreamName: "target", TableUUID: "original-table-uuid", SnapshotID: 123, StateSHA256: hex.EncodeToString(digest[:])}
+	return resyncPublication{Version: 1, ResyncID: req.WorkflowID, ExecutionID: req.RuntimeID, LaunchID: req.LaunchID, Namespace: "public", StreamName: "target", TableUUID: "original-table-uuid", SnapshotID: 123, StateSHA256: hex.EncodeToString(digest[:])}
 }
 
 func TestAtomicResyncRequiresSuccessCleanupAndMatchingPublication(t *testing.T) {
-	for _, mode := range []string{"success", "cleanup failure", "persistence failure", "missing receipt", "wrong id", "wrong namespace", "wrong target", "wrong version", "missing uuid", "missing snapshot", "state mismatch", "null state", "trailing state"} {
+	for _, mode := range []string{"success", "cleanup failure", "persistence failure", "missing receipt", "wrong id", "wrong runtime", "wrong launch", "wrong namespace", "wrong target", "wrong version", "missing uuid", "missing snapshot", "state mismatch", "null state", "trailing state"} {
 		t.Run(mode, func(t *testing.T) {
 			req, dir := atomicExecutorFixture(t)
 			ctx := context.Background()
@@ -54,6 +55,10 @@ func TestAtomicResyncRequiresSuccessCleanupAndMatchingPublication(t *testing.T) 
 				store.err = errors.New("database unavailable")
 			case "wrong id":
 				receipt.ResyncID = "other-operation"
+			case "wrong runtime":
+				receipt.ExecutionID = "old-runtime"
+			case "wrong launch":
+				receipt.LaunchID = "another-admitted-launch"
 			case "wrong namespace":
 				receipt.Namespace = "other"
 			case "wrong target":
@@ -96,7 +101,7 @@ func TestAtomicResyncRequiresSuccessCleanupAndMatchingPublication(t *testing.T) 
 }
 
 func TestFailedAndCancelledResyncNeverReadOrPersistCandidateState(t *testing.T) {
-	for _, mode := range []string{"failed confirmed unpublished", "cancelled confirmed unpublished", "unknown publication", "in progress", "stale identity", "cleanup failed"} {
+	for _, mode := range []string{"failed confirmed unpublished", "cancelled confirmed unpublished", "unknown publication", "in progress", "stale identity", "stale runtime", "stale launch", "recovery cannot abort", "cleanup failed"} {
 		t.Run(mode, func(t *testing.T) {
 			req, dir := atomicExecutorFixture(t)
 			ctx := context.Background()
@@ -104,12 +109,22 @@ func TestFailedAndCancelledResyncNeverReadOrPersistCandidateState(t *testing.T) 
 			store := &resyncStateStore{state: saved}
 			inner := &enrollmentInnerExecutor{}
 			exec := &AbstractExecutor{executor: inner, db: store}
-			proof := map[string]interface{}{"version": 1, "resync_id": req.WorkflowID, "namespace": "public", "stream_name": "target", "publication": "not_published"}
+			proof := map[string]interface{}{"version": 1, "resync_id": req.WorkflowID, "execution_id": req.RuntimeID, "launch_id": req.LaunchID, "namespace": "public", "stream_name": "target", "publication": "not_published"}
 			if mode == "in progress" {
 				proof["publication"] = "in_progress"
 			}
 			if mode == "stale identity" {
 				proof["resync_id"] = "different-operation"
+			}
+			if mode == "stale runtime" {
+				proof["execution_id"] = "prior-runtime"
+			}
+			if mode == "stale launch" {
+				proof["launch_id"] = "different-launch"
+			}
+			if mode == "recovery cannot abort" {
+				req.RecoverOnly = true
+				store.record = &database.ExecutionRecord{Controlled: true, JobID: req.JobID, WorkflowID: req.WorkflowID, OwnerRunID: req.RunID, RuntimeID: req.RuntimeID, LaunchID: req.LaunchID, Phase: "admitted", Outcome: "recovery"}
 			}
 			if mode == "cleanup failed" {
 				inner.cleanupErr = errors.New("cannot stop connector")

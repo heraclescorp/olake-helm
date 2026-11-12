@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/datazip-inc/olake-helm/worker/constants"
+	"github.com/datazip-inc/olake-helm/worker/database"
 	"github.com/datazip-inc/olake-helm/worker/storage"
 	"github.com/datazip-inc/olake-helm/worker/types"
 	"github.com/datazip-inc/olake-helm/worker/utils"
@@ -21,6 +22,8 @@ var ErrResyncUnconfirmed = errors.New("resync publication outcome is unconfirmed
 type resyncPublication struct {
 	Version     int    `json:"version"`
 	ResyncID    string `json:"resync_id"`
+	ExecutionID string `json:"execution_id"`
+	LaunchID    string `json:"launch_id"`
 	Namespace   string `json:"namespace"`
 	StreamName  string `json:"stream_name"`
 	TableUUID   string `json:"table_uuid"`
@@ -33,22 +36,43 @@ type resyncPublication struct {
 // final complete state. The receipt is emitted only after atomic publication.
 func (a *AbstractExecutor) CleanupResync(ctx context.Context, req *types.ExecutionRequest, succeeded bool) error {
 	if req.Command != types.Resync {
-		return fmt.Errorf("resync cleanup requires the resync command")
+		return fmt.Errorf("resync cleanup requires resync command")
 	}
-	if err := a.executor.Cleanup(ctx, req); err != nil {
+	r, err := a.prepareRetirement(ctx, req)
+	if err != nil {
 		return err
 	}
-	if !succeeded {
-		if err := confirmedUnpublishedResync(ctx, req); err != nil {
-			return fmt.Errorf("%w: %v", ErrResyncUnconfirmed, err)
-		}
+	if r.Phase == "closed" || r.Phase == "handoff" || r.Phase == "handed_off" {
 		return nil
 	}
-	state, err := confirmedResyncState(ctx, req)
+	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
+		applyRecord(req, current)
+		if err := utils.CloseExecutionFence(ctx, req); err != nil {
+			return err
+		}
+		if err := a.executor.Cleanup(ctx, req); err != nil {
+			return err
+		}
+		if !succeeded {
+			if err := confirmedUnpublishedResync(ctx, req); err != nil {
+				return fmt.Errorf("%w: %v", ErrResyncUnconfirmed, err)
+			}
+			return nil
+		}
+		state, err := confirmedResyncState(ctx, req)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrResyncUnconfirmed, err)
+		}
+		return a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, req.RunID, state)
+	})
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrResyncUnconfirmed, err)
+		return err
 	}
-	return a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, state)
+	outcome := "not_published"
+	if succeeded {
+		outcome = "published"
+	}
+	return a.db.FinishExecution(ctx, req, outcome)
 }
 
 func confirmedResyncState(ctx context.Context, req *types.ExecutionRequest) (string, error) {
@@ -56,7 +80,7 @@ func confirmedResyncState(ctx context.Context, req *types.ExecutionRequest) (str
 	if err != nil {
 		return "", err
 	}
-	_, dir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
+	_, dir := utils.GetExecutionDirAndSubDir(req)
 	data, err := storage.ReadFile(ctx, dir, constants.ResyncResultFile, false)
 	if err != nil {
 		return "", fmt.Errorf("resync publication is unconfirmed: %w", err)
@@ -65,7 +89,7 @@ func confirmedResyncState(ctx context.Context, req *types.ExecutionRequest) (str
 	if err := json.Unmarshal([]byte(data), &receipt); err != nil {
 		return "", fmt.Errorf("invalid resync publication receipt: %w", err)
 	}
-	if receipt.Version != 1 || receipt.ResyncID != target.ID || receipt.Namespace != target.Namespace || receipt.StreamName != target.Table || strings.TrimSpace(receipt.TableUUID) == "" || receipt.SnapshotID <= 0 {
+	if receipt.Version != 1 || receipt.ResyncID != target.ID || receipt.ExecutionID != req.RuntimeID || receipt.LaunchID != req.LaunchID || req.RuntimeID == "" || req.LaunchID == "" || receipt.Namespace != target.Namespace || receipt.StreamName != target.Table || strings.TrimSpace(receipt.TableUUID) == "" || receipt.SnapshotID <= 0 {
 		return "", fmt.Errorf("resync publication receipt does not confirm this operation and target")
 	}
 	state, err := storage.ReadFile(ctx, dir, "state.json", false)
@@ -97,7 +121,7 @@ func confirmedUnpublishedResync(ctx context.Context, req *types.ExecutionRequest
 	if err != nil {
 		return err
 	}
-	_, dir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
+	_, dir := utils.GetExecutionDirAndSubDir(req)
 	data, err := storage.ReadFile(ctx, dir, constants.ResyncFailureFile, false)
 	if err != nil {
 		return fmt.Errorf("resync publication outcome is unknown; job remains paused and owned by %s; reset/retry this same Temporal workflow ID to reconcile: %w", target.ID, err)
@@ -105,6 +129,8 @@ func confirmedUnpublishedResync(ctx context.Context, req *types.ExecutionRequest
 	var receipt struct {
 		Version     int    `json:"version"`
 		ResyncID    string `json:"resync_id"`
+		ExecutionID string `json:"execution_id"`
+		LaunchID    string `json:"launch_id"`
 		Namespace   string `json:"namespace"`
 		StreamName  string `json:"stream_name"`
 		Publication string `json:"publication"`
@@ -112,7 +138,7 @@ func confirmedUnpublishedResync(ctx context.Context, req *types.ExecutionRequest
 	if err := json.Unmarshal([]byte(data), &receipt); err != nil {
 		return fmt.Errorf("invalid resync failure receipt: %w", err)
 	}
-	if receipt.Version != 1 || receipt.ResyncID != target.ID || receipt.Namespace != target.Namespace || receipt.StreamName != target.Table || receipt.Publication != "not_published" {
+	if receipt.Version != 1 || receipt.ResyncID != target.ID || receipt.ExecutionID != req.RuntimeID || receipt.LaunchID != req.LaunchID || req.RuntimeID == "" || req.LaunchID == "" || req.RecoverOnly || receipt.Namespace != target.Namespace || receipt.StreamName != target.Table || receipt.Publication != "not_published" {
 		return fmt.Errorf("resync failure receipt does not prove this operation unpublished; retain ownership and retry the same workflow ID %s", target.ID)
 	}
 	return nil

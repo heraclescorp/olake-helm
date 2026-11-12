@@ -63,10 +63,6 @@ const (
 	ResyncIDFlag         = "--resync-id"
 	ResyncResultFile     = "resync-result.json"
 	ResyncFailureFile    = "resync-failure.json"
-	ResyncExecutionFile  = "resync-execution.json"
-	// EnrollmentGateFile distinguishes a failed metadata preflight from a sync
-	// whose connector launched and must persist its state during cleanup.
-	EnrollmentGateFile = "auto-enrollment-gate.json"
 	// Storage modes (OLAKE_STORAGE_MODE values)
 	StorageModeNFS = "nfs"
 	StorageModeS3  = "s3"

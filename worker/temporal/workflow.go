@@ -51,6 +51,8 @@ var (
 )
 
 func ExecuteWorkflow(ctx workflow.Context, req *types.ExecutionRequest) (*types.ExecutorResponse, error) {
+	req.WorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
+	req.RunID = workflow.GetInfo(ctx).WorkflowExecution.RunID
 	activityOptions := workflow.ActivityOptions{
 		StartToCloseTimeout: req.Timeout,
 		RetryPolicy:         DefaultRetryPolicy,
@@ -96,6 +98,11 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 
 	ctx = workflow.WithActivityOptions(ctx, activityOptions)
 	req.WorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
+	req.RunID = workflow.GetInfo(ctx).WorkflowExecution.RunID
+	// Admission, not workflow input, chooses the backend generation.
+	req.RuntimeID, req.LaunchID, req.LauncherAttemptID = "", "", ""
+	req.ResourceID, req.ResourceUID = "", ""
+	req.AllowLaunch, req.RecoverOnly = false, false
 
 	var activity, cleanupActivity string
 	switch req.Command {
@@ -144,7 +151,7 @@ func RunSyncWorkflow(ctx workflow.Context, args interface{}) (result *types.Exec
 				err = fmt.Errorf("cleanup failed: %s", cleanupErr)
 			}
 		}
-		if cleanupErr == nil {
+		if cleanupErr == nil && !(req.Command == types.Resync && err == nil) {
 			releaseErr := workflow.ExecuteActivity(newCtx, ReleaseJobExecutionActivity, req).Get(newCtx, nil)
 			if releaseErr != nil {
 				if err != nil {

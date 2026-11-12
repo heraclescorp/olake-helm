@@ -13,11 +13,12 @@ import (
 )
 
 type resyncStateStore struct {
+	executionTestAuthority
 	state string
 	err   error
 }
 
-func (db *resyncStateStore) UpdateJobState(_ context.Context, _ int, _ string, state string) error {
+func (db *resyncStateStore) UpdateJobState(_ context.Context, _ int, _, _ string, state string) error {
 	if db.err != nil {
 		return db.err
 	}
@@ -40,6 +41,7 @@ func TestScopedClearPersistsCompleteStateOnlyAfterCleanup(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, saved, initial)
 				require.NoError(t, storage.WriteFiles(ctx, workDir, []types.JobConfig{{Name: "state.json", Data: cleared}}))
+				writeOrdinaryExecutionProof(t, ctx, req, "settled", cleared)
 				return `{}`, nil
 			}}
 			exec := &AbstractExecutor{executor: inner, db: store}
