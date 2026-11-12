@@ -60,10 +60,11 @@ type EnrollmentSchema struct {
 }
 
 type EnrollmentDefaults struct {
-	Normalization  *bool  `json:"normalization"`
-	AppendMode     *bool  `json:"append_mode"`
-	UpdateType     string `json:"update_type"`
-	SyncNewColumns *bool  `json:"sync_new_columns"`
+	Normalization      *bool  `json:"normalization"`
+	AppendMode         *bool  `json:"append_mode"`
+	UpdateType         string `json:"update_type"`
+	SyncNewColumns     *bool  `json:"sync_new_columns"`
+	DropRemovedColumns *bool  `json:"drop_removed_columns,omitempty"`
 }
 
 type EnrollmentPolicy struct {
@@ -346,11 +347,17 @@ func (j JobData) ValidateEnrollment(result EnrollmentResult) (JobData, error) {
 		stream := newDefinitions[id].(map[string]any)["stream"].(map[string]any)
 		metadata := newSelections[id].(map[string]any)
 		columns, _ := metadata["selected_columns"].(map[string]any)
+		rawDrop, hasDrop := metadata["drop_removed_columns"]
+		dropRemovedColumns, validDrop := rawDrop.(bool)
+		if hasDrop && !validDrop {
+			return JobData{}, fmt.Errorf("enrollment addition has an invalid drop_removed_columns setting")
+		}
 		if stream["destination_database"] != approved[id.Namespace] ||
 			metadata["normalization"] != *policy.Defaults.Normalization ||
 			metadata["append_mode"] != *policy.Defaults.AppendMode ||
 			metadata["update_type"] != policy.Defaults.UpdateType ||
-			columns["sync_new_columns"] != *policy.Defaults.SyncNewColumns {
+			columns["sync_new_columns"] != *policy.Defaults.SyncNewColumns ||
+			dropRemovedColumns != (policy.Defaults.DropRemovedColumns != nil && *policy.Defaults.DropRemovedColumns) {
 			return JobData{}, fmt.Errorf("enrollment addition does not match approved destination and defaults")
 		}
 		if override, exists := metadata["destination_database"]; exists && override != approved[id.Namespace] {
