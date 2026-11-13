@@ -146,3 +146,30 @@ func TestFailedAndCancelledResyncNeverReadOrPersistCandidateState(t *testing.T) 
 		})
 	}
 }
+
+func TestCancelledPublishedResyncCannotDiscardPendingHandoff(t *testing.T) {
+	req, _ := atomicExecutorFixture(t)
+	record := &database.ExecutionRecord{Controlled: true, JobID: req.JobID, WorkflowID: req.WorkflowID, OwnerRunID: req.RunID, Phase: "handoff", RuntimeID: req.RuntimeID, LaunchID: req.LaunchID, HandoffToken: "bound-transfer", HandoffRunID: "publication-run", HandoffRequestID: "stable-request"}
+	store := &resyncStateStore{state: `{"published":true}`, executionTestAuthority: executionTestAuthority{record: record}}
+	inner := &authorityCleanupExecutor{cleanup: func(context.Context, *types.ExecutionRequest) error {
+		t.Fatal("a bound handoff is not an unpublished runtime to delete")
+		return nil
+	}}
+	exec := &AbstractExecutor{executor: inner, db: store}
+	require.ErrorIs(t, exec.CleanupResync(context.Background(), req, false), ErrResyncUnconfirmed)
+	require.Equal(t, "handoff", record.Phase)
+	require.Equal(t, "bound-transfer", record.HandoffToken)
+	require.Equal(t, "publication-run", record.HandoffRunID)
+	require.Equal(t, "stable-request", record.HandoffRequestID)
+	require.Equal(t, `{"published":true}`, store.state)
+}
+
+func TestCancelledResyncCannotReleasePublicationBeforeHandoffExists(t *testing.T) {
+	req, _ := atomicExecutorFixture(t)
+	record := &database.ExecutionRecord{Controlled: true, JobID: req.JobID, WorkflowID: req.WorkflowID, OwnerRunID: req.RunID, Phase: "closed", Outcome: "published", RuntimeID: req.RuntimeID, LaunchID: req.LaunchID}
+	store := &resyncStateStore{state: `{"published":true}`, executionTestAuthority: executionTestAuthority{record: record}}
+	exec := &AbstractExecutor{executor: &enrollmentInnerExecutor{}, db: store}
+	require.ErrorIs(t, exec.CleanupResync(context.Background(), req, false), ErrResyncUnconfirmed)
+	require.Equal(t, "published", record.Outcome)
+	require.Equal(t, `{"published":true}`, store.state)
+}

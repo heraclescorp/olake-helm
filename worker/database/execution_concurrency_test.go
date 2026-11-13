@@ -421,6 +421,41 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 			require.Error(t, db.AdoptExecution(ctx, req, executionTestRequest(req.WorkflowID, "replacement-run", types.Resync)), "changed transfer binding must also reject new controlling-run adoption")
 		})
 	}
+	for _, outcome := range []string{"not_published", "not_launched", "published"} {
+		t.Run("resync reset preserves proven outcome/"+outcome, func(t *testing.T) {
+			reset(t)
+			old := executionTestRequest("cancelled-resync", "cancelled-run", types.Resync)
+			if outcome == "not_launched" {
+				require.NoError(t, db.AcquireJobExecution(ctx, old))
+			} else {
+				admittedTestRequest(t, ctx, db, old, "original-runtime")
+			}
+			_, err := db.SealExecution(ctx, old)
+			require.NoError(t, err)
+			if outcome != "not_launched" {
+				require.NoError(t, db.FinishExecution(ctx, old, outcome))
+			}
+			newer := executionTestRequest(old.WorkflowID, "reconciliation-run", types.Resync)
+			require.NoError(t, db.AdoptExecution(ctx, old, newer))
+			require.NoError(t, db.AcquireJobExecution(ctx, newer))
+			r, err := db.GetExecution(ctx, 42, old.WorkflowID)
+			require.NoError(t, err)
+			if outcome == "published" {
+				require.Equal(t, "recovery", r.Outcome)
+				require.Equal(t, "unadmitted", r.Phase)
+				require.Error(t, db.ReleaseJobExecution(ctx, newer), "publication needs its bound recovery/handoff")
+				return
+			}
+			require.Equal(t, "retired", r.Outcome)
+			require.Equal(t, "closed", r.Phase)
+			_, launched, err := db.AdmitExecution(ctx, newer, "must-not-run", "must-not-launch")
+			require.ErrorIs(t, err, ErrExecutionClosed)
+			require.False(t, launched, "known unpublished cancellation must never relaunch the same data operation")
+			require.ErrorIs(t, db.ReleaseJobExecution(ctx, old), ErrJobExecutionOwned)
+			require.NoError(t, db.ReleaseJobExecution(ctx, newer))
+			require.NoError(t, db.AcquireJobExecution(ctx, executionTestRequest("fresh-operation", "fresh-run", types.Resync)))
+		})
+	}
 	t.Run("closed tombstone survives SQL job deletion", func(t *testing.T) {
 		reset(t)
 		req := executionTestRequest("deleted-job-operation", "run", types.ClearDestination)

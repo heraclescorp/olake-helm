@@ -69,7 +69,9 @@ func (db *activityTestAuthority) AdmitExecution(_ context.Context, req *types.Ex
 	r.LauncherAttemptID = attempt
 	if r.Controlled {
 		r.RuntimeID = req.WorkflowID
-		r.LaunchID = req.WorkflowID
+		if r.LaunchID == "" {
+			r.LaunchID = req.WorkflowID
+		}
 	}
 	return r, true, nil
 }
@@ -106,8 +108,9 @@ func (db *activityTestAuthority) AdoptExecution(_ context.Context, old, newReq *
 	if r == nil || r.OwnerRunID != old.RunID || db.owner != old.WorkflowID || db.run != old.RunID {
 		return database.ErrJobExecutionOwned
 	}
-	if newReq.Command != types.Resync && r.LaunchID != "" {
-		if r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started") {
+	retiredWithoutPublication := r.Phase == "closed" && (r.Outcome == "not_launched" || r.Outcome == "retired" || (newReq.Command == types.Resync && r.Outcome == "not_published"))
+	if retiredWithoutPublication || (newReq.Command != types.Resync && r.LaunchID != "") {
+		if !retiredWithoutPublication && (r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "retired")) {
 			return fmt.Errorf("ordinary outcome is not proven")
 		}
 		r.Outcome = "retired"

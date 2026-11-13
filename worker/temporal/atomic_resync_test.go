@@ -34,6 +34,7 @@ func (db *atomicActivityDB) GetJobData(ctx context.Context, id int) (types.JobDa
 type atomicActivityExecutor struct {
 	execute         func(context.Context, *types.ExecutionRequest) (*types.ExecutorResponse, error)
 	cleanup         func(bool) error
+	cleanupRequest  func(context.Context, *types.ExecutionRequest, bool) error
 	retire          func(context.Context, *types.ExecutionRequest) error
 	ordinaryCleanup func(context.Context, *types.ExecutionRequest) error
 }
@@ -47,7 +48,13 @@ func (e *atomicActivityExecutor) CleanupAndPersistState(ctx context.Context, req
 	}
 	return e.ordinaryCleanup(ctx, req)
 }
-func (e *atomicActivityExecutor) CleanupResync(_ context.Context, _ *types.ExecutionRequest, success bool) error {
+func (e *atomicActivityExecutor) CleanupResync(ctx context.Context, req *types.ExecutionRequest, success bool) error {
+	if e.cleanupRequest != nil {
+		return e.cleanupRequest(ctx, req, success)
+	}
+	if e.cleanup == nil {
+		return nil
+	}
 	return e.cleanup(success)
 }
 func (e *atomicActivityExecutor) RetireExecution(ctx context.Context, req *types.ExecutionRequest) error {

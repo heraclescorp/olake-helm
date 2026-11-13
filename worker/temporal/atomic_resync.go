@@ -63,8 +63,18 @@ func (a *Activity) acquireJobExecution(ctx context.Context, req *types.Execution
 		if err := a.executor.CleanupAndPersistState(ctx, &old); err != nil {
 			return fmt.Errorf("ordinary execution retirement is not proven: %w", err)
 		}
-	} else if err := a.executor.RetireExecution(ctx, &old); err != nil {
-		return fmt.Errorf("retire prior execution epoch: %w", err)
+	} else {
+		// A canceled launch can already have an exact not_published receipt.
+		// Consume it before replacing its runtime with recovery-only admission:
+		// recovery deliberately cannot infer non-publication from an absent marker.
+		if req.Command == types.Resync && r.Phase != "handoff" && r.Phase != "handed_off" {
+			if cleanupErr := a.executor.CleanupResync(ctx, &old, false); cleanupErr != nil && !errors.Is(cleanupErr, executor.ErrResyncUnconfirmed) {
+				return fmt.Errorf("resync execution retirement is not proven: %w", cleanupErr)
+			}
+		}
+		if err := a.executor.RetireExecution(ctx, &old); err != nil {
+			return fmt.Errorf("retire prior execution epoch: %w", err)
+		}
 	}
 	if err := a.db.AdoptExecution(ctx, &old, req); err != nil {
 		return err
@@ -122,6 +132,9 @@ func (a *Activity) ResyncActivity(ctx context.Context, req *types.ExecutionReque
 	current, err := a.db.GetExecution(ctx, req.JobID, req.WorkflowID)
 	if err != nil {
 		return nil, err
+	}
+	if current.Phase == "closed" && current.Outcome == "retired" {
+		return nil, temporal.NewNonRetryableApplicationError("prior resync is positively unpublished and safely retired; a fresh sync or table resync may now be requested", "PriorExecutionRetired", nil)
 	}
 	if !current.Controlled {
 		return nil, temporal.NewNonRetryableApplicationError("atomic resync requires canonical PostgreSQL to REST-family Iceberg destination", "UnsupportedAtomicResyncDomain", nil)

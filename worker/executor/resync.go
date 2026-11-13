@@ -42,7 +42,16 @@ func (a *AbstractExecutor) CleanupResync(ctx context.Context, req *types.Executi
 	if err != nil {
 		return err
 	}
-	if r.Phase == "closed" || r.Phase == "handoff" || r.Phase == "handed_off" {
+	if r.Phase == "handoff" || r.Phase == "handed_off" {
+		if !succeeded {
+			return fmt.Errorf("%w: published resync has a bound pending handoff; reconcile the same operation to finish its transfer", ErrResyncUnconfirmed)
+		}
+		return nil
+	}
+	if r.Phase == "closed" {
+		if !succeeded && r.Outcome == "published" {
+			return fmt.Errorf("%w: publication is confirmed but its handoff is unfinished; recover the same operation instead of releasing it as canceled", ErrResyncUnconfirmed)
+		}
 		return nil
 	}
 	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {

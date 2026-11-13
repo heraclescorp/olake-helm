@@ -300,8 +300,9 @@ func (db *DB) AdoptExecution(ctx context.Context, oldReq, newReq *types.Executio
 		if r.OwnerRunID != oldReq.RunID || (r.Phase != "closing" && r.Phase != "closed" && r.Phase != "handoff") {
 			return ErrExecutionClosed
 		}
-		if r.LaunchID != "" && newReq.Command != types.Resync {
-			if r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "retired") {
+		retiredWithoutPublication := r.Phase == "closed" && (r.Outcome == "not_launched" || r.Outcome == "retired" || (newReq.Command == types.Resync && r.Outcome == "not_published"))
+		if retiredWithoutPublication || (r.LaunchID != "" && newReq.Command != types.Resync) {
+			if !retiredWithoutPublication && (r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "retired")) {
 				return fmt.Errorf("ordinary execution cannot retire without positive settled outcome proof")
 			}
 			_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,outcome='retired',updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID)
