@@ -15,7 +15,7 @@ import (
 
 func (db *DB) handoffBinding(ctx context.Context, tx *sql.Tx, jobID int) (stateSHA, catalogSHA string, active bool, err error) {
 	var state, streams, available, selected string
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT state,active,COALESCE(streams_config,''),COALESCE(available_streams_config,''),COALESCE(selected_streams_config,'') FROM %s WHERE id=$1`, pq.QuoteIdentifier(db.tables["job"])), jobID).Scan(&state, &active, &streams, &available, &selected)
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT state,active,COALESCE(streams_config::text,''),COALESCE(available_streams_config::text,''),COALESCE(selected_streams_config::text,'') FROM %s WHERE id=$1`, pq.QuoteIdentifier(db.tables["job"])), jobID).Scan(&state, &active, &streams, &available, &selected)
 	if err != nil {
 		return
 	}

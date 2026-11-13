@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/datazip-inc/olake-helm/worker/types"
+	"github.com/datazip-inc/olake-helm/worker/utils"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -469,5 +470,90 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 		require.NoError(t, err)
 		require.Equal(t, "closed", r.Phase)
 		require.Error(t, db.AcquireJobExecution(ctx, req))
+	})
+}
+
+func runJSONBHandoffTests(t *testing.T, ctx context.Context, db *DB, reset func(*testing.T) types.JobData) {
+	t.Run("JSONB published and cancelled resync handoffs", func(t *testing.T) {
+		reset(t)
+		_, err := db.client.ExecContext(ctx, `ALTER TABLE enrollment_job
+			ALTER COLUMN state TYPE jsonb USING state::jsonb,
+			ALTER COLUMN streams_config TYPE jsonb USING streams_config::jsonb,
+			ALTER COLUMN available_streams_config TYPE jsonb USING available_streams_config::jsonb,
+			ALTER COLUMN selected_streams_config TYPE jsonb USING selected_streams_config::jsonb`)
+		require.NoError(t, err)
+		defer func() {
+			_, err := db.client.ExecContext(ctx, `ALTER TABLE enrollment_job
+				ALTER COLUMN state TYPE text USING state::text,
+				ALTER COLUMN streams_config TYPE text USING streams_config::text,
+				ALTER COLUMN available_streams_config TYPE text USING available_streams_config::text,
+				ALTER COLUMN selected_streams_config TYPE text USING selected_streams_config::text`)
+			require.NoError(t, err)
+		}()
+		for _, split := range []bool{false, true} {
+			t.Run(fmt.Sprintf("published split=%t", split), func(t *testing.T) {
+				reset(t)
+				if split {
+					_, err := db.client.ExecContext(ctx, `UPDATE enrollment_job SET streams_config=NULL, available_streams_config='{"streams":[{"name":"target"}]}', selected_streams_config='{"selected_streams":{"public":[{"stream_name":"target"}]}}' WHERE id=42`)
+					require.NoError(t, err)
+				}
+				req := executionTestRequest("jsonb-published", "resync-run", types.Resync)
+				admittedTestRequest(t, ctx, db, req, "data-runtime")
+				_, err := db.SealExecution(ctx, req)
+				require.NoError(t, err)
+				const publishedState = `{"global":{"lsn":9007199254740993},"streams":{"target":{"cursor":"published"}}}`
+				require.NoError(t, db.GuardExecution(ctx, req, func(ctx context.Context, _ *ExecutionRecord) error {
+					return db.UpdateJobState(ctx, req.JobID, req.WorkflowID, req.RunID, publishedState)
+				}))
+				require.NoError(t, db.FinishExecution(ctx, req, "published"))
+				require.NoError(t, db.BeginHandoff(ctx, req, "transfer-token"))
+				require.NoError(t, db.BeginHandoff(ctx, req, "retry-must-not-replace-token"))
+				r, err := db.GetExecution(ctx, req.JobID, req.WorkflowID)
+				require.NoError(t, err)
+				require.Equal(t, "handoff", r.Phase)
+				require.Equal(t, "transfer-token", r.HandoffToken)
+				require.NotEmpty(t, r.StateSHA256)
+				expectedSHA, err := utils.StateSHA256(publishedState)
+				require.NoError(t, err)
+				require.Equal(t, expectedSHA, r.StateSHA256)
+				require.NotEmpty(t, r.CatalogSHA256)
+				require.Error(t, db.ReleaseJobExecution(ctx, req))
+				requestID := ""
+				require.Error(t, db.ApplyHandoff(ctx, req, func(_ context.Context, record *ExecutionRecord) error {
+					requestID = record.HandoffRequestID
+					return errors.New("schedule patch accepted, response lost")
+				}))
+				newReq := executionTestRequest(req.WorkflowID, "reset-run", types.Resync)
+				require.NoError(t, db.AdoptExecution(ctx, req, newReq))
+				require.NoError(t, db.AcquireJobExecution(ctx, newReq))
+				require.NoError(t, db.ApplyHandoff(ctx, newReq, func(_ context.Context, record *ExecutionRecord) error {
+					require.Equal(t, requestID, record.HandoffRequestID)
+					require.Equal(t, "resync-run", record.HandoffRunID)
+					require.Equal(t, "transfer-token", record.HandoffToken)
+					return nil
+				}))
+				applied := false
+				require.NoError(t, db.ApplyHandoff(ctx, newReq, func(context.Context, *ExecutionRecord) error { applied = true; return nil }))
+				require.False(t, applied)
+				var state string
+				require.NoError(t, db.client.QueryRowContext(ctx, `SELECT state FROM enrollment_job WHERE id=42`).Scan(&state))
+				require.JSONEq(t, publishedState, state)
+				require.NoError(t, db.AcquireJobExecution(ctx, executionTestRequest("new-operation", "new-run", types.Resync)))
+			})
+		}
+		t.Run("proven unpublished cancellation preserves checkpoint", func(t *testing.T) {
+			reset(t)
+			req := executionTestRequest("jsonb-cancelled", "resync-run", types.Resync)
+			admittedTestRequest(t, ctx, db, req, "cancelled-runtime")
+			_, err := db.SealExecution(ctx, req)
+			require.NoError(t, err)
+			require.Error(t, db.ReleaseJobExecution(ctx, req))
+			require.NoError(t, db.FinishExecution(ctx, req, "not_published"))
+			require.NoError(t, db.ReleaseJobExecution(ctx, req))
+			var state string
+			require.NoError(t, db.client.QueryRowContext(ctx, `SELECT state FROM enrollment_job WHERE id=42`).Scan(&state))
+			require.JSONEq(t, `{"global":{"lsn":"unmodified-global-lsn"},"streams":{"public.old":{"cursor":"123"}}}`, state)
+			require.NoError(t, db.AcquireJobExecution(ctx, executionTestRequest("after-cancel", "new-run", types.Resync)))
+		})
 	})
 }
