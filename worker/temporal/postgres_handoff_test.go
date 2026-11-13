@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,28 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 )
+
+type retryJSONBHandoffDB struct {
+	*database.DB
+	connection   *sql.DB
+	jobTable     string
+	attempts     atomic.Int32
+	firstFailure atomic.Value
+}
+
+func (db *retryJSONBHandoffDB) BeginHandoff(ctx context.Context, req *types.ExecutionRequest, token string) error {
+	if db.attempts.Add(1) == 1 {
+		var value string
+		err := db.connection.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(streams_config,'') FROM %s WHERE id=$1`, db.jobTable), req.JobID).Scan(&value)
+		if err == nil {
+			db.firstFailure.Store("old query unexpectedly succeeded")
+			return fmt.Errorf("old JSONB query unexpectedly succeeded")
+		}
+		db.firstFailure.Store(err.Error())
+		return err
+	}
+	return db.DB.BeginHandoff(ctx, req, token)
+}
 
 func TestPublishedResyncWorkflowWithJSONBPostgres(t *testing.T) {
 	dsn := os.Getenv("OLAKE_ENROLLMENT_TEST_DSN")
@@ -79,11 +102,12 @@ func TestPublishedResyncWorkflowWithJSONBPostgres(t *testing.T) {
 	db, err := database.Init(ctx)
 	require.NoError(t, err)
 	defer db.Close()
+	retryDB := &retryJSONBHandoffDB{DB: db, connection: connection, jobTable: job}
 	const published = `{"global":{"lsn":9007199254740993},"streams":{"target":{"cursor":"published"}}}`
 	workflowID := "sync-project-42-resync-jsonb"
 	handle := &resyncScheduleHandle{schedule: client.Schedule{State: &client.ScheduleState{Paused: true}}, loseFirstAck: true}
 	remote := &resyncTemporalClient{schedules: &resyncScheduleClient{handle: handle}, service: &resyncServiceClient{patch: handle.patch}}
-	a := &Activity{db: db, tempClient: remote, executor: &atomicActivityExecutor{cleanupRequest: func(ctx context.Context, req *types.ExecutionRequest, success bool) error {
+	a := &Activity{db: retryDB, tempClient: remote, executor: &atomicActivityExecutor{cleanupRequest: func(ctx context.Context, req *types.ExecutionRequest, success bool) error {
 		require.True(t, success)
 		record, err := db.GetExecution(ctx, req.JobID, req.WorkflowID)
 		require.NoError(t, err)
@@ -116,6 +140,8 @@ func TestPublishedResyncWorkflowWithJSONBPostgres(t *testing.T) {
 	env.ExecuteWorkflow(RunSyncWorkflow, req)
 	require.NoError(t, env.GetWorkflowError())
 	env.AssertExpectations(t)
+	require.EqualValues(t, 2, retryDB.attempts.Load())
+	require.Contains(t, retryDB.firstFailure.Load(), "invalid input syntax for type json")
 	record, err := db.GetExecution(ctx, 42, workflowID)
 	require.NoError(t, err)
 	require.Equal(t, "handed_off", record.Phase)
