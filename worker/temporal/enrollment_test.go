@@ -26,6 +26,7 @@ const activityOldCatalog = `{"streams":[{"stream":{"namespace":"public","name":"
 const activityNewCatalog = `{"streams":[{"stream":{"namespace":"public","name":"old"}},{"stream":{"namespace":"public","name":"new","destination_database":"lake","destination_table":"new","sync_mode":"cdc"}}],"selected_streams":{"public":[{"stream_name":"new","normalization":true,"append_mode":false,"update_type":"pos","selected_columns":{"columns":["id"],"sync_new_columns":false}}]}}`
 
 type enrollmentActivityDB struct {
+	activityTestAuthority
 	job             types.JobData
 	commits         int
 	reads           int
@@ -44,7 +45,7 @@ func (db *enrollmentActivityDB) GetJobData(context.Context, int) (types.JobData,
 func (db *enrollmentActivityDB) GetProjectSettingsByProjectID(context.Context, string) (*types.ProjectSettings, error) {
 	return &types.ProjectSettings{}, nil
 }
-func (db *enrollmentActivityDB) CommitCatalogEnrollment(ctx context.Context, _ int, original types.JobData, result types.EnrollmentResult) error {
+func (db *enrollmentActivityDB) CommitCatalogEnrollment(ctx context.Context, _ *types.ExecutionRequest, original types.JobData, result types.EnrollmentResult) error {
 	db.commits++
 	if err := ctx.Err(); err != nil {
 		return err
@@ -74,6 +75,12 @@ func (e *enrollmentActivityExecutor) Execute(ctx context.Context, req *types.Exe
 func (e *enrollmentActivityExecutor) CleanupAndPersistState(context.Context, *types.ExecutionRequest) error {
 	return nil
 }
+func (e *enrollmentActivityExecutor) CleanupResync(context.Context, *types.ExecutionRequest, bool) error {
+	return nil
+}
+func (e *enrollmentActivityExecutor) RetireExecution(context.Context, *types.ExecutionRequest) error {
+	return nil
+}
 
 func activityEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, *enrollmentActivityDB) {
 	t.Helper()
@@ -87,6 +94,7 @@ func activityEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, *enrollme
 	req := &types.ExecutionRequest{Command: types.Sync, ConnectorType: "stale", Version: "stale", JobID: int(time.Now().UnixNano()),
 		WorkflowID: fmt.Sprintf("enrollment-test-%s-%d", t.Name(), time.Now().UnixNano()), ProjectID: "project", Timeout: time.Minute,
 		Args: []string{"sync", "--config", "/mnt/config/source.json", "--destination", "/mnt/config/destination.json", "--state", "/mnt/config/state.json"}}
+	req.RunID = "test-controlling-run"
 	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(workDir)) })
 	// Mark the synthetic job ineligible for telemetry run counting, so tests never
@@ -291,15 +299,12 @@ func TestSyncRetryEnrollmentUsesActualOrdinaryLaunchBoundary(t *testing.T) {
 					writeActivityEnrollmentResult(t, ctx, request, result)
 					return &types.ExecutorResponse{}, nil
 				}
-				// Ordinary retries retain files once connector logs establish launch.
-				_, dir := utils.GetWorkflowDirAndSubDir(request.WorkflowID, request.Command)
-				alreadyLaunched, err := utils.WorkflowAlreadyLaunched(ctx, dir)
-				require.NoError(t, err)
-				if !alreadyLaunched {
+				// SQL admission, not log presence, owns the initialization boundary.
+				_, dir := utils.GetExecutionDirAndSubDir(request)
+				if request.AllowLaunch {
 					require.NoError(t, storage.WriteFiles(ctx, dir, request.Configs))
 				}
-				require.NoError(t, utils.MarkEnrollmentIngestionStarted(ctx, request))
-				if launched && !alreadyLaunched {
+				if launched && request.AllowLaunch {
 					require.NoError(t, storage.WriteFiles(ctx, dir, []types.JobConfig{
 						{Name: filepath.Join("logs", "run", "olake.log"), Data: "connector started"},
 						{Name: "state.json", Data: `{"global":{"lsn":"running-lsn"}}`},
@@ -317,16 +322,15 @@ func TestSyncRetryEnrollmentUsesActualOrdinaryLaunchBoundary(t *testing.T) {
 			_, err := env.ExecuteActivity(a.SyncActivity, req)
 			require.Error(t, err)
 			require.JSONEq(t, activityNewCatalog, db.job.Streams)
-			pending, err := utils.EnrollmentPreflightPending(context.Background(), req)
+			current, err := db.GetExecution(context.Background(), req.JobID, req.WorkflowID)
 			require.NoError(t, err)
-			require.False(t, pending, "both provider outcomes have the pre-launch gate set")
+			require.Equal(t, "admitted", current.Phase, "both provider outcomes already crossed the durable launch boundary")
 
 			lateTableExists, providerFailure = true, false
 			_, err = env.ExecuteActivity(a.SyncActivity, req)
 			require.NoError(t, err)
-			wantCatalog, wantState := lateCatalog, originalState
+			wantCatalog, wantState := activityNewCatalog, originalState
 			if launched {
-				wantCatalog = activityNewCatalog
 				wantState = `{"global":{"lsn":"running-lsn"}}`
 			}
 			require.JSONEq(t, wantCatalog, db.job.Streams, "a launched retry cannot persist newly discovered selections")
@@ -342,6 +346,10 @@ func TestSyncRetryEnrollmentUsesActualOrdinaryLaunchBoundary(t *testing.T) {
 			if launched {
 				// A different scheduled workflow has no ordinary launch marker and
 				// must still enroll the table that appeared during the previous run.
+				previous, err := db.GetExecution(context.Background(), req.JobID, req.WorkflowID)
+				require.NoError(t, err)
+				previous.Phase = "closed"
+				require.NoError(t, db.ReleaseJobExecution(context.Background(), req))
 				freshReq := *req
 				freshReq.WorkflowID += "-next"
 				_, freshDir := utils.GetWorkflowDirAndSubDir(freshReq.WorkflowID, freshReq.Command)
@@ -356,87 +364,6 @@ func TestSyncRetryEnrollmentUsesActualOrdinaryLaunchBoundary(t *testing.T) {
 				require.NoError(t, err)
 				require.JSONEq(t, activityNewCatalog, previousCatalog)
 				require.Equal(t, originalState, db.job.State)
-			}
-		})
-	}
-}
-
-func TestResyncFollowupReloadsFullCatalogAndRunsEnrollment(t *testing.T) {
-	for _, split := range []bool{false, true} {
-		t.Run(fmt.Sprintf("split=%t", split), func(t *testing.T) {
-			req, db := activityEnrollmentFixture(t)
-			req.Command = types.ClearDestination
-			req.StartSyncAfterClear = true
-			req.TempPath = "table-resync/state.json"
-			req.Configs = []types.JobConfig{
-				{Name: constants.StreamsFile, Data: `{"streams":[{"stream":{"namespace":"public","name":"scoped-only"}}]}`},
-				{Name: "source.json", Data: `{"host":"stale-source"}`},
-				{Name: "state.json", Data: `{"global":{"lsn":"stale-lsn"}}`},
-			}
-			db.job.Version = "v0.15.0"
-			db.job.State = `{"global":{"lsn":"preserved-lsn"},"streams":{"public.old":{"cursor":"after-clear"},"public.unrelated":{"cursor":"keep"}}}`
-			state := db.job.State
-			result := types.EnrollmentResult{Enrolled: []types.EnrollmentID{{Namespace: "public", StreamName: "new"}}, Streams: activityNewCatalog}
-			if split {
-				parts := func(catalog string) (string, string) {
-					var fields map[string]json.RawMessage
-					require.NoError(t, json.Unmarshal([]byte(catalog), &fields))
-					return `{"streams":` + string(fields["streams"]) + `}`, `{"selected_streams":` + string(fields["selected_streams"]) + `}`
-				}
-				db.job.AvailableStreams, db.job.SelectedStreams = parts(db.job.Streams)
-				db.job.Streams = ""
-				result.AvailableStreams, result.SelectedStreams = parts(result.Streams)
-				result.Streams = ""
-				req.Args = utils.SetCatalogArgs(req.Args, true)
-			}
-			utils.RevertUpdatesInSchedule(req)
-			require.Empty(t, req.Configs)
-			require.Empty(t, req.TempPath)
-			var ingested bool
-			exec := &enrollmentActivityExecutor{execute: func(ctx context.Context, request *types.ExecutionRequest) (*types.ExecutorResponse, error) {
-				configs := make(map[string]string)
-				for _, config := range request.Configs {
-					configs[config.Name] = config.Data
-				}
-				require.Equal(t, db.job.Version, request.Version)
-				require.Equal(t, db.job.Source, configs["source.json"])
-				if request.Command == types.DiscoverNewTables {
-					if split {
-						require.JSONEq(t, db.job.AvailableStreams, configs[constants.AvailableStreamsFile])
-						require.JSONEq(t, db.job.SelectedStreams, configs[constants.SelectedStreamsFile])
-					} else {
-						require.JSONEq(t, activityOldCatalog, configs[constants.StreamsFile])
-					}
-					require.NotContains(t, configs, "state.json")
-					writeActivityEnrollmentResult(t, ctx, request, result)
-					return &types.ExecutorResponse{}, nil
-				}
-				require.Equal(t, types.Sync, request.Command)
-				require.Equal(t, state, configs["state.json"])
-				if split {
-					require.JSONEq(t, result.AvailableStreams, configs[constants.AvailableStreamsFile])
-					require.JSONEq(t, result.SelectedStreams, configs[constants.SelectedStreamsFile])
-					require.NotContains(t, request.Args, constants.CatalogFlag)
-				} else {
-					require.JSONEq(t, activityNewCatalog, configs[constants.StreamsFile])
-					require.NotContains(t, request.Args, constants.AvailableStreamsFlag)
-				}
-				ingested = true
-				return &types.ExecutorResponse{Response: "full-job-ingested"}, nil
-			}}
-			a := &Activity{db: db, executor: exec}
-			var suite testsuite.WorkflowTestSuite
-			env := suite.NewTestActivityEnvironment()
-			env.RegisterActivity(a.SyncActivity)
-			_, err := env.ExecuteActivity(a.SyncActivity, req)
-			require.NoError(t, err)
-			require.True(t, ingested)
-			require.Equal(t, state, db.job.State)
-			if split {
-				require.JSONEq(t, result.AvailableStreams, db.job.AvailableStreams)
-				require.JSONEq(t, result.SelectedStreams, db.job.SelectedStreams)
-			} else {
-				require.JSONEq(t, activityNewCatalog, db.job.Streams)
 			}
 		})
 	}

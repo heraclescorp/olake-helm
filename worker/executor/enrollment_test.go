@@ -17,10 +17,11 @@ import (
 )
 
 type enrollmentStateStore struct {
+	executionTestAuthority
 	state string
 }
 
-func (db *enrollmentStateStore) UpdateJobState(_ context.Context, _ int, state string) error {
+func (db *enrollmentStateStore) UpdateJobState(_ context.Context, _ int, _, _ string, state string) error {
 	db.state = state
 	return nil
 }
@@ -37,6 +38,9 @@ func (e *enrollmentInnerExecutor) Cleanup(context.Context, *types.ExecutionReque
 	return e.cleanupErr
 }
 func (e *enrollmentInnerExecutor) Close() error { return nil }
+func (e *enrollmentInnerExecutor) ResolveResource(context.Context, *types.ExecutionRequest) error {
+	return nil
+}
 
 func executorEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, string) {
 	t.Helper()
@@ -44,72 +48,59 @@ func executorEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, string) {
 	viper.Set(constants.EnvStorageMode, constants.StorageModeNFS)
 	viper.Set(constants.EnvKubernetesServiceHost, "")
 	t.Cleanup(func() { viper.Set(constants.EnvStorageMode, mode); viper.Set(constants.EnvKubernetesServiceHost, kube) })
-	req := &types.ExecutionRequest{Command: types.Sync, WorkflowID: fmt.Sprintf("gate-test-%s-%d", t.Name(), time.Now().UnixNano()), JobID: 42}
-	_, dir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
+	id := fmt.Sprintf("executor-test-%s-%d", t.Name(), time.Now().UnixNano())
+	req := &types.ExecutionRequest{Controlled: true, Command: types.Sync, WorkflowID: id, RunID: "test-run", RuntimeID: id, LaunchID: id, JobID: 42, AllowLaunch: true, BeforeLaunch: func(context.Context) error { return nil }}
+	_, dir := utils.GetExecutionDirAndSubDir(req)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
 	return req, dir
 }
 
-func TestPreflightOnlyCleanupPreservesExactSavedState(t *testing.T) {
+func TestPreflightOnlyCleanupPreservesExactSavedStateWithoutBackendOrProof(t *testing.T) {
 	req, dir := executorEnrollmentFixture(t)
 	ctx := context.Background()
-	state := ` {"global":{"lsn":"exact-preserved-lsn"},"streams":{"public.old":{"cursor":"keep"}}} `
-	store := &enrollmentStateStore{state: state}
-	inner := &enrollmentInnerExecutor{cleanupErr: errors.New("ordinary Docker container does not exist")}
-	exec := &AbstractExecutor{executor: inner, db: store}
-	require.NoError(t, utils.BeginEnrollmentPreflight(ctx, req))
+	saved := ` {"global":{"lsn":"exact-preserved-lsn"},"streams":{"other":{"cursor":"keep"}}} `
+	store := &enrollmentStateStore{state: saved, executionTestAuthority: executionTestAuthority{prelaunch: true}}
+	inner := &enrollmentInnerExecutor{cleanupErr: errors.New("no backend was admitted")}
+	a := &AbstractExecutor{executor: inner, db: store}
 	_, err := storage.ReadFile(ctx, dir, "state.json", false)
-	require.Error(t, err, "preflight must not create or rewrite the ingestion state")
-	require.NoError(t, exec.CleanupAndPersistState(ctx, req))
-	require.Equal(t, state, store.state)
-	pending, err := utils.EnrollmentPreflightPending(ctx, req)
-	require.NoError(t, err)
-	require.True(t, pending)
+	require.Error(t, err)
+	require.NoError(t, a.CleanupAndPersistState(ctx, req))
+	require.Equal(t, saved, store.state)
+	require.Equal(t, "not_launched", store.record.Outcome)
 }
 
-func TestStartedAndOrdinarySyncStillFailWhenStateIsMissing(t *testing.T) {
-	for _, withGate := range []bool{false, true} {
-		t.Run(fmt.Sprint(withGate), func(t *testing.T) {
-			req, _ := executorEnrollmentFixture(t)
-			ctx := context.Background()
-			if withGate {
-				require.NoError(t, utils.BeginEnrollmentPreflight(ctx, req))
-				require.NoError(t, utils.MarkEnrollmentIngestionStarted(ctx, req))
-			}
-			store := &enrollmentStateStore{state: `{"global":{"lsn":"saved"}}`}
-			exec := &AbstractExecutor{executor: &enrollmentInnerExecutor{}, db: store}
-			require.Error(t, exec.CleanupAndPersistState(ctx, req))
-		})
-	}
-}
-
-func TestSyncTransitionsGateAfterConfigWriteEvenWhenPolicyWasDisabledOnRetry(t *testing.T) {
+func TestAttachRetryNeverRewritesConfigOrCheckpointEvenWithoutConnectorLogs(t *testing.T) {
 	req, dir := executorEnrollmentFixture(t)
 	ctx := context.Background()
-	state := `{"global":{"lsn":"saved"},"streams":{"public.old":{"cursor":"keep"}}}`
-	store := &enrollmentStateStore{state: `{"global":{"lsn":"previously-persisted"}}`}
-	require.NoError(t, utils.BeginEnrollmentPreflight(ctx, req))
-	// This request need not carry an enrollment policy: disabling it after a
-	// previous failed preflight must not make real ingestion look preflight-only.
-	req.Configs = []types.JobConfig{{Name: "state.json", Data: state}, {Name: constants.StreamsFile, Data: `{"streams":[{"stream":{"name":"new","namespace":"public"}}]}`}}
-	inner := &enrollmentInnerExecutor{execute: func(ctx context.Context, request *types.ExecutionRequest, workDir string) (string, error) {
-		require.Equal(t, dir, workDir)
-		pending, err := utils.EnrollmentPreflightPending(ctx, request)
+	saved := `{"global":{"lsn":"saved"}}`
+	running := `{"global":{"lsn":"running"}}`
+	req.Configs = []types.JobConfig{{Name: "state.json", Data: saved}, {Name: constants.StreamsFile, Data: `{"streams":[]}`}}
+	calls := 0
+	inner := &enrollmentInnerExecutor{execute: func(ctx context.Context, current *types.ExecutionRequest, workdir string) (string, error) {
+		calls++
+		require.Equal(t, dir, workdir)
+		state, err := storage.ReadFile(ctx, workdir, "state.json", false)
 		require.NoError(t, err)
-		require.False(t, pending, "gate must be durable before the connector launches")
-		written, err := storage.ReadFile(ctx, workDir, "state.json", false)
-		require.NoError(t, err)
-		require.Equal(t, state, written, "ordinary configs must exist before the gate flips")
+		if calls == 1 {
+			require.True(t, current.AllowLaunch)
+			require.Equal(t, saved, state)
+			require.NoError(t, storage.WriteFileAtomic(ctx, dir, "state.json", running))
+			writeOrdinaryExecutionProof(t, ctx, current, "settled", running)
+		} else {
+			require.False(t, current.AllowLaunch)
+			require.Equal(t, running, state)
+		}
 		return `{}`, nil
 	}}
-	exec := &AbstractExecutor{executor: inner, db: store}
-	_, err := exec.Execute(ctx, req)
+	store := &enrollmentStateStore{state: saved}
+	a := &AbstractExecutor{executor: inner, db: store}
+	_, err := a.Execute(ctx, req)
 	require.NoError(t, err)
-	// A retry after an ordinary launch must never rewrite this gate false.
-	require.NoError(t, utils.BeginEnrollmentPreflight(ctx, req))
-	pending, err := utils.EnrollmentPreflightPending(ctx, req)
+	req.AllowLaunch = false
+	req.Configs = []types.JobConfig{{Name: "state.json", Data: `{"stale":true}`}}
+	_, err = a.Execute(ctx, req)
 	require.NoError(t, err)
-	require.False(t, pending)
-	require.NoError(t, exec.CleanupAndPersistState(ctx, req))
-	require.Equal(t, state, store.state)
+	require.Equal(t, 2, calls)
+	require.NoError(t, a.CleanupAndPersistState(ctx, req))
+	require.Equal(t, running, store.state)
 }

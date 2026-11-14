@@ -15,6 +15,7 @@ const (
 	Spec              Command = "spec"
 	Check             Command = "check"
 	Sync              Command = "sync"
+	Resync            Command = "resync"
 	ClearDestination  Command = "clear-destination"
 )
 
@@ -76,6 +77,35 @@ func (j JobData) IndexRequired() (bool, error) {
 	}
 
 	return settings.IndexRequired, nil
+}
+
+// SupportsAtomicResync is derived from the canonical saved job, never request
+// flags. Keep this catalog family aligned with connector constants.RESTCatalogs.
+func (j JobData) SupportsAtomicResync() (bool, error) {
+	if !strings.EqualFold(strings.TrimSpace(j.Driver), "postgres") {
+		return false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(j.DestinationDriver), "iceberg") {
+		return false, nil
+	}
+	var destination struct {
+		Type   string `json:"type"`
+		Writer struct {
+			CatalogType string `json:"catalog_type"`
+		} `json:"writer"`
+	}
+	if err := json.Unmarshal([]byte(j.Destination), &destination); err != nil {
+		return false, fmt.Errorf("invalid canonical destination configuration: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(destination.Type), "ICEBERG") {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(destination.Writer.CatalogType)) {
+	case "rest", "lakekeeper", "nessie", "s3tables", "unity", "polaris", "biglake", "horizon":
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 type WebhookNotificationArgs struct {

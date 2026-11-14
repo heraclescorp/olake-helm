@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/datazip-inc/olake-helm/worker/constants"
 	"github.com/datazip-inc/olake-helm/worker/types"
 	"github.com/spf13/viper"
@@ -163,6 +164,40 @@ func writeFilesS3(ctx context.Context, workDir string, configs []types.JobConfig
 	}
 
 	return nil
+}
+
+// writeFileAtomicS3 uses one complete PutObject, never a read-before-write
+// existence check. Only a 412 proves an object already exists; conflicting or
+// ambiguous requests remain errors and cannot authorize runtime launch.
+func writeFileAtomicS3(ctx context.Context, dir, filename, data string, createOnly bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	key, err := S3Key(dir, filename, false)
+	if err != nil {
+		return false, err
+	}
+	client, bucket, err := getS3Client()
+	if err != nil {
+		return false, err
+	}
+	input := &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+		Body:   strings.NewReader(data),
+	}
+	if createOnly {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err = client.PutObject(ctx, input)
+	if err != nil {
+		var responseError *smithyhttp.ResponseError
+		if createOnly && errors.As(err, &responseError) && responseError.HTTPStatusCode() == 412 {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to publish s3://%s/%s: %w", bucket, key, err)
+	}
+	return true, nil
 }
 
 // readFileS3 reads a file from the S3 bucket.

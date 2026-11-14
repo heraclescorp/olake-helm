@@ -24,7 +24,7 @@ import (
 	"github.com/datazip-inc/olake-helm/worker/utils/logger"
 )
 
-func (k *KubernetesExecutor) waitForPodCompletion(ctx context.Context, podName string, timeout time.Duration, heartbeatFunc func(context.Context, ...interface{})) error {
+func (k *KubernetesExecutor) waitForPodCompletion(ctx context.Context, podName, podUID string, timeout time.Duration, heartbeatFunc func(context.Context, ...interface{})) error {
 	log := logger.Log(ctx)
 	log.Debug("waiting for pod to complete", "podName", podName, "timeout", timeout)
 	deadline := time.Now().Add(timeout)
@@ -50,6 +50,9 @@ func (k *KubernetesExecutor) waitForPodCompletion(ctx context.Context, podName s
 			}
 			log.Error("failed to get pod status", "podName", podName, "error", err)
 			return fmt.Errorf("failed to get pod status: %s", err)
+		}
+		if podUID != "" && string(pod.UID) != podUID {
+			return fmt.Errorf("execution outcome unknown: Kubernetes resource UID changed while waiting")
 		}
 
 		if !scheduledLogged && pod.Spec.NodeName != "" {
@@ -274,6 +277,10 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 		return nil, fmt.Errorf("job %d operation %s: %w", req.JobID, req.Command, err)
 	}
 	subDir := filepath.Base(workDir)
+	artifactID := req.WorkflowID
+	if req.Controlled && utils.IsAsyncCommand(req.Command) {
+		artifactID = req.RuntimeID
+	}
 
 	var volumeMounts []corev1.VolumeMount
 	var volumes []corev1.Volume
@@ -315,8 +322,8 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      k.sanitizeName(req.WorkflowID), // Sanitized name safe for Kubernetes
-			Namespace: k.namespace,                    // Target namespace for pod creation
+			Name:      k.podResourceName(req),
+			Namespace: k.namespace,
 
 			// Labels are used for querying, filtering, and organizing pods; global.jobPodLabels merged in
 			Labels: k.buildPodLabels(map[string]string{
@@ -392,7 +399,7 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 						},
 						{
 							Name:  constants.EnvS3ConfigFolder,
-							Value: utils.ConnectorConfigDir(req.Command, req.WorkflowID),
+							Value: utils.ConnectorConfigDir(req.Command, artifactID),
 						},
 						{
 							Name:  constants.EnvSecretKey,
@@ -404,6 +411,10 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 			},
 			Volumes: volumes,
 		},
+	}
+	if req.Controlled && utils.IsAsyncCommand(req.Command) && req.RuntimeID != "" {
+		pod.Annotations["olake.io/runtime-id"] = req.RuntimeID
+		pod.Annotations["olake.io/launch-id"] = req.LaunchID
 	}
 	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, runtimeEnv...)
 

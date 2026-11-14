@@ -102,15 +102,16 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 		CREATE TABLE enrollment_destination(id integer PRIMARY KEY, config text, version text, dest_type text, name text);
 		CREATE TABLE enrollment_job(id integer PRIMARY KEY, name text, streams_config text, available_streams_config text,
 			selected_streams_config text, state text, project_id text, source_id integer, dest_id integer,
-			advanced_settings jsonb, frequency text, created_at timestamptz, updated_at timestamptz);
+			advanced_settings jsonb, frequency text, created_at timestamptz, updated_at timestamptz, execution_workflow_id text, execution_run_id text, active boolean NOT NULL DEFAULT true);
 		INSERT INTO enrollment_source VALUES(1,'{"host":"source"}','v-test','postgres','source');
-		INSERT INTO enrollment_destination VALUES(2,'{"type":"ICEBERG","writer":{}}','v-dest','iceberg','destination');`)
+		INSERT INTO enrollment_destination VALUES(2,'{"type":"ICEBERG","writer":{"catalog_type":"rest"}}','v-dest','iceberg','destination');`)
 	require.NoError(t, err)
+	createExecutionTestTable(t, ctx, db)
 	state := `{"global":{"lsn":"unmodified-global-lsn"},"streams":{"public.old":{"cursor":"123"}}}`
 	reset := func(t *testing.T) types.JobData {
-		_, err := client.ExecContext(ctx, `TRUNCATE enrollment_job;
-			UPDATE enrollment_source SET config='{"host":"source"}';
-			UPDATE enrollment_destination SET config='{"type":"ICEBERG","writer":{}}';`)
+		_, err := client.ExecContext(ctx, `TRUNCATE enrollment_job_execution_records,enrollment_job;
+			UPDATE enrollment_source SET config='{"host":"source"}',type='postgres';
+			UPDATE enrollment_destination SET config='{"type":"ICEBERG","writer":{"catalog_type":"rest"}}',dest_type='iceberg';`)
 		require.NoError(t, err)
 		_, err = client.ExecContext(ctx, `INSERT INTO enrollment_job(id,name,streams_config,state,project_id,source_id,dest_id,advanced_settings,frequency,created_at)
 			VALUES(42,'test',$1,$2,'project',1,2,$3::jsonb,'15m',NOW())`, dbOldCatalog, state, dbEnrollmentSettings)
@@ -119,6 +120,9 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 		require.NoError(t, err)
 		return job
 	}
+	runExecutionConcurrencyTests(t, ctx, db, reset, state)
+	runJSONBHandoffTests(t, ctx, db, reset)
+	enrollmentReq := executionTestRequest("ordinary-sync", "enrollment-run", types.Sync)
 	t.Run("ordinary job loading without automatic enrollment", func(t *testing.T) {
 		reset(t)
 		_, err := client.ExecContext(ctx, `UPDATE enrollment_job SET advanced_settings='{"auto_table_enrollment":{"enabled":false}}' WHERE id=42`)
@@ -135,11 +139,12 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 	})
 	t.Run("durable commit preserves global state and retry does not duplicate", func(t *testing.T) {
 		original := reset(t)
+		require.NoError(t, db.AcquireJobExecution(ctx, enrollmentReq))
 		// State may advance independently while discovery is running.
 		newState := `{"global":{"lsn":"newer-lsn"},"streams":{"public.old":{"cursor":"456"}}}`
 		_, err := client.ExecContext(ctx, `UPDATE enrollment_job SET state=$1 WHERE id=42`, newState)
 		require.NoError(t, err)
-		require.NoError(t, db.CommitCatalogEnrollment(ctx, 42, original, dbEnrollmentResult()))
+		require.NoError(t, db.CommitCatalogEnrollment(ctx, enrollmentReq, original, dbEnrollmentResult()))
 		fresh, err := db.GetJobData(ctx, 42)
 		require.NoError(t, err)
 		require.Equal(t, newState, fresh.State)
@@ -150,8 +155,8 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, index)
 		// A lost commit acknowledgement cannot make the stale proposal repeat.
-		require.ErrorIs(t, db.CommitCatalogEnrollment(ctx, 42, original, dbEnrollmentResult()), ErrEnrollmentConflict)
-		require.NoError(t, db.CommitCatalogEnrollment(ctx, 42, fresh, types.EnrollmentResult{Streams: fresh.Streams}))
+		require.ErrorIs(t, db.CommitCatalogEnrollment(ctx, enrollmentReq, original, dbEnrollmentResult()), ErrEnrollmentConflict)
+		require.NoError(t, db.CommitCatalogEnrollment(ctx, enrollmentReq, fresh, types.EnrollmentResult{Streams: fresh.Streams}))
 	})
 	for _, mutation := range []string{
 		`UPDATE enrollment_job SET streams_config='{"streams":[]}' WHERE id=42`,
@@ -161,6 +166,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 	} {
 		t.Run("conflict/"+strings.Fields(mutation)[1], func(t *testing.T) {
 			original := reset(t)
+			require.NoError(t, db.AcquireJobExecution(ctx, enrollmentReq))
 			uiTx, err := client.BeginTx(ctx, nil)
 			require.NoError(t, err)
 			defer uiTx.Rollback()
@@ -169,7 +175,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 			_, err = uiTx.ExecContext(ctx, mutation)
 			require.NoError(t, err)
 			finished := make(chan error, 1)
-			go func() { finished <- db.CommitCatalogEnrollment(ctx, 42, original, dbEnrollmentResult()) }()
+			go func() { finished <- db.CommitCatalogEnrollment(ctx, enrollmentReq, original, dbEnrollmentResult()) }()
 			require.NoError(t, uiTx.Commit())
 			require.ErrorIs(t, <-finished, ErrEnrollmentConflict)
 			var actualState string
@@ -180,6 +186,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 	for _, completion := range []string{"cancel", "release"} {
 		t.Run("catalog edit fence/"+completion, func(t *testing.T) {
 			original := reset(t)
+			require.NoError(t, db.AcquireJobExecution(ctx, enrollmentReq))
 			fence, err := client.BeginTx(ctx, nil)
 			require.NoError(t, err)
 			defer fence.Rollback()
@@ -191,7 +198,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 			defer stopWorker()
 			finished := make(chan error, 1)
 			go func() {
-				finished <- db.CommitCatalogEnrollment(workerCtx, 42, original, dbEnrollmentResult())
+				finished <- db.CommitCatalogEnrollment(workerCtx, enrollmentReq, original, dbEnrollmentResult())
 			}()
 			// Observe the actual server lock wait rather than inferring blocking
 			// from a sleep or goroutine scheduling order.
@@ -213,7 +220,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 			// deadline also proves the worker has not taken row locks first.
 			newState := fmt.Sprintf(`{"global":{"lsn":"state-during-%s-fence"}}`, completion)
 			stateCtx, cancelState := context.WithTimeout(ctx, time.Second)
-			err = db.UpdateJobState(stateCtx, 42, newState)
+			err = db.UpdateJobState(stateCtx, 42, enrollmentReq.WorkflowID, enrollmentReq.RunID, newState)
 			cancelState()
 			require.NoError(t, err, "ordinary state persistence must not acquire or wait behind the catalog fence")
 			if completion == "cancel" {
@@ -245,9 +252,10 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 	}
 	t.Run("cancelled proposal is not committed", func(t *testing.T) {
 		original := reset(t)
+		require.NoError(t, db.AcquireJobExecution(ctx, enrollmentReq))
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
-		require.Error(t, db.CommitCatalogEnrollment(cancelled, 42, original, dbEnrollmentResult()))
+		require.Error(t, db.CommitCatalogEnrollment(cancelled, enrollmentReq, original, dbEnrollmentResult()))
 		fresh, err := db.GetJobData(ctx, 42)
 		require.NoError(t, err)
 		require.Equal(t, original.Streams, fresh.Streams)

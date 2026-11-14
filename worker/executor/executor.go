@@ -20,6 +20,7 @@ import (
 type Executor interface {
 	Execute(ctx context.Context, req *types.ExecutionRequest, workdir string) (string, error)
 	Cleanup(ctx context.Context, req *types.ExecutionRequest) error
+	ResolveResource(context.Context, *types.ExecutionRequest) error
 	Close() error
 }
 
@@ -29,7 +30,11 @@ type FailureIndicator interface {
 }
 
 type jobStateStore interface {
-	UpdateJobState(context.Context, int, string) error
+	UpdateJobState(context.Context, int, string, string, string) error
+	SealExecution(context.Context, *types.ExecutionRequest) (*database.ExecutionRecord, error)
+	GuardExecution(context.Context, *types.ExecutionRequest, func(context.Context, *database.ExecutionRecord) error) error
+	FinishExecution(context.Context, *types.ExecutionRequest, string) error
+	RecordExecutionResource(context.Context, *types.ExecutionRequest, string, string) error
 }
 
 type AbstractExecutor struct {
@@ -60,23 +65,39 @@ func NewExecutor(ctx context.Context, db *database.DB) (*AbstractExecutor, error
 }
 
 func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequest) (*types.ExecutorResponse, error) {
-	log := logger.Log(ctx)
-	subdir, workdir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
-
-	// write config files only for the first/scheduled workflow execution (not for retries)
-	alreadyLaunched, err := utils.WorkflowAlreadyLaunched(ctx, workdir)
-	if err != nil {
-		return nil, err
+	if req.Command == types.Resync && !req.Controlled {
+		return nil, fmt.Errorf("atomic resync is outside the canonical supported domain")
 	}
-	if !alreadyLaunched && req.Configs != nil {
-		if err := storage.WriteFiles(ctx, workdir, req.Configs); err != nil {
-			log.Error("failed to write config files", "workdir", workdir, "error", err)
+	if utils.IsAsyncCommand(req.Command) && req.Controlled && req.RuntimeID == "" {
+		return nil, fmt.Errorf("controlled asynchronous execution requires durable runtime identity")
+	}
+	utils.SetExecutionArgs(req)
+	log := logger.Log(ctx)
+	subdir, workdir := utils.GetExecutionDirAndSubDir(req)
+
+	// Only the admitted launcher initializes its immutable runtime namespace.
+	// Attach retries never rewrite state/config/proof inputs of a live runtime.
+	if req.Controlled {
+		if req.AllowLaunch {
+			if req.BeforeLaunch == nil {
+				return nil, fmt.Errorf("admitted launcher requires authoritative launch guard")
+			}
+			if err := req.BeforeLaunch(ctx); err != nil {
+				return nil, err
+			}
+			if err := storage.WriteFiles(ctx, workdir, req.Configs); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		launched, err := utils.WorkflowAlreadyLaunched(ctx, workdir)
+		if err != nil {
 			return nil, err
 		}
-	}
-	if req.Command == types.Sync {
-		if err := utils.MarkEnrollmentIngestionStarted(ctx, req); err != nil {
-			return nil, err
+		if !launched && req.Configs != nil {
+			if err := storage.WriteFiles(ctx, workdir, req.Configs); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -114,40 +135,106 @@ func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequ
 	return &types.ExecutorResponse{Response: filepath.Join(subdir, constants.OutputFileName)}, nil
 }
 
-// CleanupAndPersistState stops the container/pod and saves the state file in the database
-func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *types.ExecutionRequest) error {
-	log := logger.Log(ctx)
+// Retirement is serialized against epoch adoption and API mutations. SQL seals
+// admission before CLOSED is acknowledged, then cleanup addresses only the
+// provider identity persisted by that admitted runtime.
+func (a *AbstractExecutor) RetireExecution(ctx context.Context, req *types.ExecutionRequest) error {
+	r, err := a.prepareRetirement(ctx, req)
+	if err != nil {
+		return err
+	}
+	if r.Phase == "closed" || r.Phase == "handoff" || r.Phase == "handed_off" {
+		return nil
+	}
+	return a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
+		return a.executor.Cleanup(ctx, req)
+	})
+}
 
-	var gateErr error
-	if req.Command == types.Sync {
-		pending, err := utils.EnrollmentPreflightPending(ctx, req)
-		gateErr = err
-		if err == nil && pending {
-			log.Info("metadata preflight ended before ingestion; preserving saved job state", "jobID", req.JobID)
-			return nil
+func (a *AbstractExecutor) prepareRetirement(ctx context.Context, req *types.ExecutionRequest) (*database.ExecutionRecord, error) {
+	r, err := a.db.SealExecution(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	applyRecord(req, r)
+	if r.Phase == "closed" || r.Phase == "handoff" || r.Phase == "handed_off" {
+		return r, nil
+	}
+	if !r.Controlled {
+		return r, nil
+	}
+	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
+		if err := utils.CloseExecutionFence(ctx, req); err != nil {
+			return err
+		}
+		return a.executor.ResolveResource(ctx, req)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Persist discovered immutable identity before deletion, so lost deletion or
+	// final SQL acknowledgements never require a name-only cleanup retry.
+	if req.ResourceID != "" && (r.ResourceID != req.ResourceID || r.ResourceUID != req.ResourceUID) {
+		if err := a.db.RecordExecutionResource(ctx, req, req.ResourceID, req.ResourceUID); err != nil {
+			return nil, err
 		}
 	}
-	if err := a.executor.Cleanup(ctx, req); err != nil {
-		log.Error("failed to cleanup executor", "workflowID", req.WorkflowID, "error", err)
-		return err
-	}
-	if gateErr != nil {
-		return gateErr
-	}
+	return r, nil
+}
 
-	stateFile, err := utils.GetStateFileFromWorkdir(ctx, req.WorkflowID, req.Command)
+func applyRecord(req *types.ExecutionRequest, r *database.ExecutionRecord) {
+	req.RuntimeID, req.LaunchID = r.RuntimeID, r.LaunchID
+	req.ResourceID, req.ResourceUID = r.ResourceID, r.ResourceUID
+	req.LauncherAttemptID = r.LauncherAttemptID
+	req.RecoverOnly = r.Outcome == "recovery"
+	req.Controlled = r.Controlled
+}
+
+func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *types.ExecutionRequest) error {
+	if req.Command == types.Resync {
+		return fmt.Errorf("resync requires confirmed publication")
+	}
+	r, err := a.prepareRetirement(ctx, req)
 	if err != nil {
-		log.Error("failed to read state file", "workflowID", req.WorkflowID, "error", err)
 		return err
 	}
-
-	if err := a.db.UpdateJobState(ctx, req.JobID, stateFile); err != nil {
-		log.Error("failed to update job state in database", "jobID", req.JobID, "error", err)
+	if r.Phase == "closed" {
+		return nil
+	}
+	outcome := ""
+	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
+		applyRecord(req, current)
+		if req.Controlled {
+			if err := utils.CloseExecutionFence(ctx, req); err != nil {
+				return err
+			}
+		}
+		if err := a.executor.Cleanup(ctx, req); err != nil {
+			return err
+		}
+		if !req.Controlled {
+			_, dir := utils.GetExecutionDirAndSubDir(req)
+			state, err := storage.ReadFile(ctx, dir, "state.json", true)
+			if err != nil {
+				return err
+			}
+			outcome = "legacy_completed"
+			return a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, req.RunID, state)
+		}
+		state, confirmedOutcome, err := confirmedExecutionResult(ctx, req)
+		if err != nil {
+			return err
+		}
+		outcome = confirmedOutcome
+		if state == nil {
+			return nil
+		}
+		return a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, req.RunID, *state)
+	})
+	if err != nil {
 		return err
 	}
-
-	log.Info("successfully cleaned up and persisted state", "jobID", req.JobID)
-	return nil
+	return a.db.FinishExecution(ctx, req, outcome)
 }
 
 func (a *AbstractExecutor) FailureIndicator() FailureIndicator {

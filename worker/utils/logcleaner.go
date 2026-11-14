@@ -80,6 +80,22 @@ func cleanNFSOldLogs(logDir string, retentionPeriod int) {
 			continue
 		}
 		dirPath := filepath.Join(logDir, entry.Name())
+		_, fenceErr := os.Stat(filepath.Join(dirPath, ExecutionFenceFile))
+		_, pointerErr := os.Stat(filepath.Join(dirPath, ExecutionPointerFile))
+		if fenceErr == nil || pointerErr == nil || !os.IsNotExist(fenceErr) || !os.IsNotExist(pointerErr) {
+			// Control/proof/config artifacts outlive log retention. Deleting CLOSED
+			// would let an old delayed create-if-absent OPEN recreate this identity.
+			_ = filepath.Walk(dirPath, func(filePath string, info os.FileInfo, walkErr error) error {
+				if walkErr != nil || info == nil || info.IsDir() {
+					return nil
+				}
+				if (strings.HasSuffix(info.Name(), ".log") || strings.HasSuffix(info.Name(), ".log.gz")) && info.ModTime().Before(cutoff) {
+					_ = os.Remove(filePath)
+				}
+				return nil
+			})
+			continue
+		}
 		if toDelete := shouldDelete(dirPath, cutoff); toDelete {
 			logger.Infof("deleting folder: %s", dirPath)
 			_ = os.RemoveAll(dirPath)
@@ -116,6 +132,25 @@ func cleanS3OldLogs(ctx context.Context, retentionPeriod int) {
 	}
 
 	for _, group := range groups {
+		controlled := false
+		for _, object := range group {
+			base := path.Base(object.Key)
+			if base == ExecutionFenceFile || base == ExecutionPointerFile {
+				controlled = true
+				break
+			}
+		}
+		if controlled {
+			for _, object := range group {
+				base := path.Base(object.Key)
+				if (strings.HasSuffix(base, ".log") || strings.HasSuffix(base, ".log.gz")) && object.LastModified.Before(cutoff) {
+					if err := storage.DeleteS3Object(ctx, object.Key); err != nil {
+						logger.Errorf("failed to delete retained-runtime log %s: %s", object.Key, err)
+					}
+				}
+			}
+			continue
+		}
 		for _, s3object := range group {
 			if !shouldCheckModTime(path.Base(s3object.Key)) || !s3object.LastModified.Before(cutoff) {
 				continue
