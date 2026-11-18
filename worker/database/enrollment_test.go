@@ -16,8 +16,8 @@ import (
 )
 
 const dbEnrollmentSettings = `{"index_required":false,"unrelated":{"keep":9007199254740993},"auto_table_enrollment":{"enabled":true,"schemas":[{"namespace":"public","destination_database":"lake"}],"defaults":{"normalization":true,"append_mode":false,"update_type":"pos","sync_new_columns":false}}}`
-const dbOldCatalog = `{"streams":[{"stream":{"namespace":"public","name":"old","destination_database":"lake"}}],"selected_streams":{"public":[{"stream_name":"old","normalization":false,"append_mode":true}]}}`
-const dbNewCatalog = `{"streams":[{"stream":{"namespace":"public","name":"old","destination_database":"lake"}},{"stream":{"namespace":"public","name":"new","destination_database":"lake","destination_table":"new","sync_mode":"cdc"}}],"selected_streams":{"public":[{"stream_name":"old","normalization":false,"append_mode":true},{"stream_name":"new","normalization":true,"append_mode":false,"update_type":"pos","selected_columns":{"columns":["id"],"sync_new_columns":false}}]}}`
+const dbOldCatalog = `{"default_sort_order":[{"column":"created_at","direction":"asc","null_order":"nulls-last"}],"streams":[{"stream":{"namespace":"public","name":"old","destination_database":"lake"}}],"selected_streams":{"public":[{"stream_name":"old","normalization":false,"append_mode":true,"sort_order":[]}]}}`
+const dbNewCatalog = `{"default_sort_order":[{"column":"created_at","direction":"asc","null_order":"nulls-last"}],"streams":[{"stream":{"namespace":"public","name":"old","destination_database":"lake"}},{"stream":{"namespace":"public","name":"new","destination_database":"lake","destination_table":"new","sync_mode":"cdc"}}],"selected_streams":{"public":[{"stream_name":"old","normalization":false,"append_mode":true,"sort_order":[]},{"stream_name":"new","normalization":true,"append_mode":false,"update_type":"pos","selected_columns":{"columns":["id"],"sync_new_columns":false}}]}}`
 
 func dbEnrollmentResult() types.EnrollmentResult {
 	return types.EnrollmentResult{Enrolled: []types.EnrollmentID{{Namespace: "public", StreamName: "new"}}, Streams: dbNewCatalog}
@@ -148,6 +148,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 		require.NoError(t, db.CommitCatalogEnrollment(ctx, enrollmentReq, original, dbEnrollmentResult()))
 		fresh, err := db.GetJobData(ctx, 42)
 		require.NoError(t, err)
+		require.Equal(t, dbNewCatalog, fresh.Streams, "durable enrollment must retain the catalog default and explicit unsorted override")
 		require.Equal(t, newState, fresh.State)
 		require.Equal(t, "15m", fresh.Frequency)
 		require.Equal(t, "v-test", fresh.Version)

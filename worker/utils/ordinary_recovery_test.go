@@ -76,3 +76,46 @@ func TestOrdinaryRecoveryRejectsInvalidPostgresBoundaries(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1)<<32|1, value)
 }
+
+func TestSortPolicyEditsChangeRevisionAndRemainOutsideOrdinaryRecovery(t *testing.T) {
+	const preset = `[{"column":"created_at","direction":"asc","null_order":"nulls-last"}]`
+	const custom = `[{"column":"id","direction":"desc","null_order":"nulls-first"}]`
+	const selection = `{"default_sort_order":` + preset + `,"selected_streams":{"public":[{"stream_name":"old","sort_order":` + custom + `}]}}`
+	for _, split := range []bool{false, true} {
+		for _, mutation := range []struct{ from, to string }{
+			{`"default_sort_order":` + preset, `"default_sort_order":[]`},
+			{`"default_sort_order":` + preset + `,`, ""},
+			{`,"sort_order":` + custom, ""},
+			{`"sort_order":` + custom, `"sort_order":[]`},
+		} {
+			job := types.JobData{Driver: "postgres", DestinationDriver: "iceberg", Source: `{"host":"source"}`, Destination: `{"type":"ICEBERG","writer":{"catalog_type":"rest"}}`, State: `{}`}
+			files := map[string]string{"source.json": job.Source, "destination.json": job.Destination}
+			catalog, filename := &job.Streams, constants.StreamsFile
+			if split {
+				job.AvailableStreams = `{"streams":[]}`
+				files[constants.AvailableStreamsFile] = job.AvailableStreams
+				catalog, filename = &job.SelectedStreams, constants.SelectedStreamsFile
+				*catalog = selection
+			} else {
+				*catalog = strings.Replace(selection, `{`, `{"streams":[],`, 1)
+			}
+			files[filename] = *catalog
+			stateSHA, err := StateSHA256(job.State)
+			require.NoError(t, err)
+			require.NoError(t, ValidateOrdinaryRecoveryJob(job, files, stateSHA))
+			revision, err := job.CatalogRevision()
+			require.NoError(t, err)
+			originalHash, err := OrdinaryCatalogSHA256(files)
+			require.NoError(t, err)
+			*catalog = strings.Replace(*catalog, mutation.from, mutation.to, 1)
+			changedRevision, err := job.CatalogRevision()
+			require.NoError(t, err)
+			require.NotEqual(t, revision, changedRevision)
+			require.Error(t, ValidateOrdinaryRecoveryJob(job, files, stateSHA), "sort-only edits must not bypass original launch shape fences")
+			files[filename] = *catalog
+			changedHash, err := OrdinaryCatalogSHA256(files)
+			require.NoError(t, err)
+			require.NotEqual(t, originalHash, changedHash)
+		}
+	}
+}
