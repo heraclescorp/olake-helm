@@ -39,23 +39,25 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		if err != nil {
 			return err
 		}
+		if origin, _, files, originErr := utils.ReadOrdinaryRecoveryOrigin(ctx, req); originErr == nil {
+			if err := utils.ValidateOrdinaryRecoveryJob(job, files, origin.BaselineStateSHA256); err != nil {
+				return err
+			}
+			return utils.PreserveOrdinaryRecoveryServer(ctx, req, origin)
+		} else if !errors.Is(originErr, fs.ErrNotExist) {
+			return originErr
+		}
 		files, err := utils.ReadOrdinaryFrozenConfigs(ctx, req)
 		if err != nil {
 			return err
 		}
-		original := *req
-		original.RuntimeID = req.LaunchID
-		_, originalDir := utils.GetExecutionDirAndSubDir(&original)
-		receipt, err := storage.ReadFile(ctx, originalDir, executionResultFile, false)
+		receipt, err := utils.ReadOrdinaryRecoveryOriginalReceipt(ctx, req, false)
 		if err != nil {
 			return err
 		}
-		var proof executionResult
-		if err := json.Unmarshal([]byte(receipt), &proof); err != nil {
-			return err
-		}
-		if proof.Version != 1 || proof.ExecutionID != req.LaunchID || proof.LaunchID != req.LaunchID || proof.Command != "sync" || proof.Outcome != "unknown" {
-			return fmt.Errorf("ordinary recovery requires the original identity-bound unknown sync receipt")
+		receiptSHA := ""
+		if receipt != "" {
+			receiptSHA = utils.RawSHA256(receipt)
 		}
 		_, stableDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
 		// A crash between these two create-only publications is retried against
@@ -81,7 +83,7 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		if err != nil {
 			return err
 		}
-		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: req.LaunchID, OriginalLaunchID: req.LaunchID, OriginalReceiptSHA256: utils.RawSHA256(receipt), SourceSHA256: utils.RawSHA256(files["source.json"]), DestinationSHA256: utils.RawSHA256(files["destination.json"]), CatalogSHA256: catalogSHA, BaselineStateSHA256: baselineSHA}
+		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: req.LaunchID, OriginalLaunchID: req.LaunchID, OriginalReceiptSHA256: receiptSHA, SourceSHA256: utils.RawSHA256(files["source.json"]), DestinationSHA256: utils.RawSHA256(files["destination.json"]), CatalogSHA256: catalogSHA, BaselineStateSHA256: baselineSHA}
 		data, err := json.Marshal(origin)
 		if err != nil {
 			return err
@@ -92,6 +94,11 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		persisted, _, _, err := utils.ReadOrdinaryRecoveryOrigin(ctx, req)
 		if err != nil {
 			return err
+		}
+		// A late original receipt cannot add a binding to an existing unbound
+		// origin. ReadOrdinaryRecoveryOrigin enforces every nonempty binding.
+		if persisted.OriginalReceiptSHA256 == "" {
+			origin.OriginalReceiptSHA256 = ""
 		}
 		if persisted != origin {
 			return fmt.Errorf("immutable ordinary recovery origin conflicts with original evidence")

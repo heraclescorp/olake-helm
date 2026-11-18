@@ -64,6 +64,11 @@ func ordinaryRecoveryFixture(t *testing.T) (*AbstractExecutor, *ordinaryRecovery
 func prepareRecoveryRuntime(t *testing.T) (*AbstractExecutor, *ordinaryRecoveryStore, *types.ExecutionRequest, string) {
 	t.Helper()
 	a, store, req, _ := ordinaryRecoveryFixture(t)
+	return prepareRecoveryRuntimeFromOriginal(t, a, store, req)
+}
+
+func prepareRecoveryRuntimeFromOriginal(t *testing.T, a *AbstractExecutor, store *ordinaryRecoveryStore, req *types.ExecutionRequest) (*AbstractExecutor, *ordinaryRecoveryStore, *types.ExecutionRequest, string) {
+	t.Helper()
 	require.NoError(t, a.PrepareOrdinaryRecovery(context.Background(), req))
 	req.RunID, req.RuntimeID = "recovery-run", req.RuntimeID+"-recovery"
 	req.RecoverOnly, req.AllowLaunch = true, true
@@ -111,7 +116,7 @@ func TestOrdinaryRecoveryFreezesUnknownOriginWithoutRelabelingOriginal(t *testin
 }
 
 func TestOrdinaryRecoveryPreparationFailsClosed(t *testing.T) {
-	for _, mode := range []string{"clear", "uncontrolled", "missing resource", "delete failed", "wrong original receipt", "changed original source", "missing PK", "full refresh", "missing membership", "not GLOBAL", "checkpoint changed after partial origin"} {
+	for _, mode := range []string{"clear", "uncontrolled", "missing resource", "delete failed", "wrong original receipt", "empty original receipt", "foreign original receipt", "missing receipt retirement failed", "missing receipt ownership lost", "changed original source", "missing PK", "full refresh", "missing membership", "not GLOBAL", "checkpoint changed after partial origin"} {
 		t.Run(mode, func(t *testing.T) {
 			a, store, req, dir := ordinaryRecoveryFixture(t)
 			saved := store.job.State
@@ -126,6 +131,17 @@ func TestOrdinaryRecoveryPreparationFailsClosed(t *testing.T) {
 				a.executor.(*enrollmentInnerExecutor).cleanupErr = errors.New("exact UID deletion unconfirmed")
 			case "wrong original receipt":
 				writeOrdinaryExecutionProof(t, context.Background(), req, "settled", ordinaryBaseline)
+			case "empty original receipt":
+				require.NoError(t, storage.WriteFileAtomic(context.Background(), dir, executionResultFile, ""))
+			case "foreign original receipt":
+				require.NoError(t, storage.WriteFileAtomic(context.Background(), dir, executionResultFile, `{"version":1,"execution_id":"foreign","launch_id":"foreign","command":"sync","outcome":"unknown"}`))
+			case "missing receipt retirement failed", "missing receipt ownership lost":
+				require.NoError(t, os.Remove(dir+"/"+executionResultFile))
+				if mode == "missing receipt retirement failed" {
+					a.executor.(*enrollmentInnerExecutor).cleanupErr = errors.New("exact UID deletion unconfirmed")
+				} else {
+					store.authorityErr = database.ErrJobExecutionOwned
+				}
 			case "changed original source":
 				require.NoError(t, storage.WriteFileAtomic(context.Background(), dir, "source.json", `{"host":"changed"}`))
 			case "missing PK", "full refresh":
@@ -311,22 +327,20 @@ func TestOrdinaryRecoveryRetriesAttachWithoutRewritingAndPinServerAcrossEpochs(t
 	require.Equal(t, result.ServerIdentity, server.ServerIdentity)
 }
 
-func TestOrdinaryRecoveryInterruptedEpochRequiresPinnedServerOrPositiveNoStart(t *testing.T) {
+func TestOrdinaryRecoveryInterruptedEpochWithoutPinAllowsOnlyRecovery(t *testing.T) {
 	for _, outcome := range []string{"unknown", "not_started", "missing"} {
 		t.Run(outcome, func(t *testing.T) {
 			a, store, req, _ := prepareRecoveryRuntime(t)
+			ctx := context.Background()
 			if outcome != "missing" {
-				writeOrdinaryExecutionProof(t, context.Background(), req, outcome, "")
+				writeOrdinaryExecutionProof(t, ctx, req, outcome, "")
 			}
-			err := a.PrepareOrdinaryRecovery(context.Background(), req)
-			if outcome == "not_started" {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
-			}
+			require.NoError(t, a.PrepareOrdinaryRecovery(ctx, req))
+			require.NoError(t, utils.RequireClosedExecutionFence(ctx, req))
+			require.Error(t, a.CleanupAndPersistState(ctx, req), "missing helper pin/receipt is not settlement proof")
 			require.Equal(t, ordinaryBaseline, store.job.State)
 			require.Equal(t, "closing", store.record.Phase)
-			require.Equal(t, "recovery", store.record.Outcome, "no-start successor is never settlement of unknown original")
+			require.Equal(t, "recovery", store.record.Outcome)
 		})
 	}
 	a, _, req, dir := prepareRecoveryRuntime(t)
@@ -338,4 +352,113 @@ func TestOrdinaryRecoveryInterruptedEpochRequiresPinnedServerOrPositiveNoStart(t
 	require.NoError(t, err)
 	require.NoError(t, storage.WriteFileAtomic(context.Background(), dir, utils.OrdinaryRecoveryServerFile, string(data)))
 	require.Error(t, a.PrepareOrdinaryRecovery(context.Background(), req), "an interrupted epoch cannot replace the durable server identity")
+}
+
+func TestOrdinaryRecoveryMissingOriginalReceiptKeepsImmutableUnboundOrigin(t *testing.T) {
+	for _, mode := range []string{"no original receipt", "late original receipt", "late settled original receipt", "late not-started original receipt", "missing fresh receipt", "missing fresh result", "late invalid original receipt"} {
+		t.Run(mode, func(t *testing.T) {
+			a, store, req, originalDir := ordinaryRecoveryFixture(t)
+			ctx := context.Background()
+			require.NoError(t, os.Remove(originalDir+"/"+executionResultFile))
+			require.NoError(t, a.PrepareOrdinaryRecovery(ctx, req))
+			origin, baseline, files, err := utils.ReadOrdinaryRecoveryOrigin(ctx, req)
+			require.NoError(t, err)
+			require.Empty(t, origin.OriginalReceiptSHA256, "absence is not the hash of empty or fabricated receipt bytes")
+			require.Equal(t, ordinaryBaseline, baseline)
+			require.Equal(t, store.job.Source, files["source.json"])
+			_, stable := utils.GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
+			immutable, err := storage.ReadFile(ctx, stable, utils.OrdinaryRecoveryOriginFile, false)
+			require.NoError(t, err)
+			require.NoError(t, a.PrepareOrdinaryRecovery(ctx, req))
+			lateOutcome := ""
+			switch mode {
+			case "late original receipt":
+				lateOutcome = "unknown"
+			case "late settled original receipt":
+				lateOutcome = "settled"
+			case "late not-started original receipt":
+				lateOutcome = "not_started"
+			}
+			if lateOutcome != "" {
+				writeOrdinaryExecutionProof(t, ctx, req, lateOutcome, ordinaryFinal)
+				require.NoError(t, a.PrepareOrdinaryRecovery(ctx, req))
+				require.Equal(t, ordinaryBaseline, store.job.State)
+				require.NotEqual(t, "settled", store.record.Outcome, "late original outcome cannot settle the recovery epoch")
+			}
+			a, store, req, dir := prepareRecoveryRuntimeFromOriginal(t, a, store, req)
+			result := recoveryResultFixture(t, req, dir)
+			require.Equal(t, origin, result.OrdinaryRecoveryOrigin)
+			if mode == "late invalid original receipt" {
+				data, err := json.Marshal(executionResult{Version: 1, ExecutionID: "foreign", LaunchID: req.LaunchID, Command: "sync", Outcome: "unknown"})
+				require.NoError(t, err)
+				require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, executionResultFile, string(data)))
+			}
+			require.NoError(t, storage.WriteFileAtomic(ctx, dir, "state.json", ordinaryFinal))
+			if mode != "missing fresh receipt" {
+				writeOrdinaryExecutionProof(t, ctx, req, "settled", ordinaryFinal)
+			}
+			if mode != "missing fresh result" {
+				data, err := json.Marshal(result)
+				require.NoError(t, err)
+				require.NoError(t, storage.WriteFileAtomic(ctx, dir, utils.OrdinaryRecoveryResultFile, string(data)))
+			}
+			err = a.CleanupAndPersistState(ctx, req)
+			if mode == "no original receipt" || lateOutcome != "" {
+				require.NoError(t, err)
+				require.Equal(t, ordinaryFinal, store.job.State)
+				require.Equal(t, "settled", store.record.Outcome)
+			} else {
+				require.Error(t, err)
+				require.Equal(t, ordinaryBaseline, store.job.State)
+				require.Equal(t, "closing", store.record.Phase)
+				require.Equal(t, "recovery", store.record.Outcome)
+			}
+			unchanged, err := storage.ReadFile(ctx, stable, utils.OrdinaryRecoveryOriginFile, false)
+			require.NoError(t, err)
+			require.Equal(t, immutable, unchanged)
+			if lateOutcome == "" && mode != "late invalid original receipt" {
+				_, err := storage.ReadFile(ctx, originalDir, executionResultFile, false)
+				require.ErrorIs(t, err, os.ErrNotExist, "recovery must not fabricate the missing original receipt")
+			}
+		})
+	}
+}
+
+func TestOrdinaryRecoveryMissingRuntimePinPreservesAndValidatesStablePin(t *testing.T) {
+	for _, mode := range []string{"stable pin", "malformed stable pin", "foreign stable pin", "malformed runtime pin"} {
+		t.Run(mode, func(t *testing.T) {
+			a, store, req, dir := prepareRecoveryRuntime(t)
+			ctx := context.Background()
+			result := recoveryResultFixture(t, req, dir)
+			pin, err := storage.ReadFile(ctx, dir, utils.OrdinaryRecoveryServerFile, false)
+			require.NoError(t, err)
+			_, stable := utils.GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
+			if mode == "malformed runtime pin" {
+				require.NoError(t, storage.WriteFileAtomic(ctx, dir, utils.OrdinaryRecoveryServerFile, "{"))
+			} else {
+				require.NoError(t, os.Remove(dir+"/"+utils.OrdinaryRecoveryServerFile))
+				if mode == "malformed stable pin" {
+					pin = "{"
+				} else if mode == "foreign stable pin" {
+					pin = strings.Replace(pin, result.SourceSHA256, "foreign", 1)
+				}
+				require.NoError(t, storage.WriteFileAtomic(ctx, stable, utils.OrdinaryRecoveryServerFile, pin))
+			}
+			err = a.PrepareOrdinaryRecovery(ctx, req)
+			if mode == "stable pin" {
+				require.NoError(t, err)
+				req.RuntimeID += "-next"
+				require.NoError(t, a.ordinaryRecoveryInputs(ctx, req))
+				configs := make(map[string]string)
+				for _, config := range req.Configs {
+					configs[config.Name] = config.Data
+				}
+				require.Equal(t, pin, configs[utils.OrdinaryRecoveryServerFile])
+			} else {
+				require.Error(t, err)
+			}
+			require.Equal(t, ordinaryBaseline, store.job.State)
+			require.NotEqual(t, "settled", store.record.Outcome)
+		})
+	}
 }

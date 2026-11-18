@@ -30,7 +30,7 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 	viper.Set(constants.EnvStorageMode, constants.StorageModeNFS)
 	viper.Set(constants.EnvKubernetesServiceHost, "")
 	defer func() { viper.Set(constants.EnvStorageMode, mode); viper.Set(constants.EnvKubernetesServiceHost, kube) }()
-	fixture := func(t *testing.T) (*types.ExecutionRequest, *types.ExecutionRequest) {
+	fixtureWithReceipt := func(t *testing.T, bindReceipt bool) (*types.ExecutionRequest, *types.ExecutionRequest) {
 		t.Helper()
 		reset(t)
 		_, err := db.client.ExecContext(ctx, `UPDATE enrollment_job SET streams_config=$1,state=$2 WHERE id=42`, recoveryDBCatalog, recoveryDBBaseline)
@@ -50,13 +50,17 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		for name, data := range files {
 			require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, name, data))
 		}
-		require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, "execution-result.json", receipt))
+		receiptSHA := ""
+		if bindReceipt {
+			require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, "execution-result.json", receipt))
+			receiptSHA = utils.RawSHA256(receipt)
+		}
 		require.NoError(t, storage.WriteFileAtomic(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, recoveryDBBaseline))
 		catalogSHA, err := utils.OrdinaryCatalogSHA256(files)
 		require.NoError(t, err)
 		stateSHA, err := utils.StateSHA256(recoveryDBBaseline)
 		require.NoError(t, err)
-		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: old.RuntimeID, OriginalLaunchID: old.LaunchID, OriginalReceiptSHA256: utils.RawSHA256(receipt), SourceSHA256: utils.RawSHA256(job.Source), DestinationSHA256: utils.RawSHA256(job.Destination), CatalogSHA256: catalogSHA, BaselineStateSHA256: stateSHA}
+		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: old.RuntimeID, OriginalLaunchID: old.LaunchID, OriginalReceiptSHA256: receiptSHA, SourceSHA256: utils.RawSHA256(job.Source), DestinationSHA256: utils.RawSHA256(job.Destination), CatalogSHA256: catalogSHA, BaselineStateSHA256: stateSHA}
 		data, err := json.Marshal(origin)
 		require.NoError(t, err)
 		require.NoError(t, storage.WriteFileAtomic(ctx, stableDir, utils.OrdinaryRecoveryOriginFile, string(data)))
@@ -64,6 +68,9 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		require.NoError(t, err)
 		require.NoError(t, utils.CloseExecutionFence(ctx, old))
 		return old, executionTestRequest(old.WorkflowID, "recovery-run", types.Sync)
+	}
+	fixture := func(t *testing.T) (*types.ExecutionRequest, *types.ExecutionRequest) {
+		return fixtureWithReceipt(t, true)
 	}
 	adopt := func(t *testing.T, old, newer *types.ExecutionRequest) {
 		t.Helper()
@@ -173,7 +180,7 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		require.Equal(t, old.LaunchID, r.LaunchID)
 		require.NotEqual(t, r.LaunchID, r.RuntimeID)
 	})
-	for _, change := range []string{"saved source", "saved destination", "saved catalog", "saved checkpoint", "origin hash", "original receipt", "resource UID", "unsupported clear"} {
+	for _, change := range []string{"saved source", "saved destination", "saved catalog", "saved checkpoint", "origin hash", "original receipt", "bound receipt missing", "resource UID", "unsupported clear"} {
 		t.Run("ordinary adoption rejects changed evidence/"+change, func(t *testing.T) {
 			old, newer := fixture(t)
 			switch change {
@@ -195,6 +202,9 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 			case "original receipt":
 				_, dir := utils.GetExecutionDirAndSubDir(old)
 				require.NoError(t, storage.WriteFileAtomic(ctx, dir, "execution-result.json", `{"outcome":"settled"}`))
+			case "bound receipt missing":
+				_, dir := utils.GetExecutionDirAndSubDir(old)
+				require.NoError(t, os.Remove(dir+"/execution-result.json"))
 			case "resource UID":
 				old.ResourceUID = "foreign"
 			case "unsupported clear":
@@ -296,5 +306,77 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		job, err := db.GetJobData(ctx, 42)
 		require.NoError(t, err)
 		require.Equal(t, recoveryDBBaseline, job.State)
+	})
+	for _, late := range []string{"absent", "valid", "invalid"} {
+		t.Run("missing original receipt remains immutable/"+late, func(t *testing.T) {
+			old, newer := fixtureWithReceipt(t, false)
+			origin, _, _, err := utils.ReadOrdinaryRecoveryOrigin(ctx, old)
+			require.NoError(t, err)
+			require.Empty(t, origin.OriginalReceiptSHA256)
+			_, stableDir := utils.GetWorkflowDirAndSubDir(old.WorkflowID, types.Sync)
+			immutable, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryOriginFile, false)
+			require.NoError(t, err)
+			if late != "absent" {
+				_, originalDir := utils.GetExecutionDirAndSubDir(old)
+				outcome := "unknown"
+				if late == "invalid" {
+					outcome = "settled"
+				}
+				receipt := fmt.Sprintf(`{"version":1,"execution_id":%q,"launch_id":%q,"command":"sync","outcome":%q}`, old.RuntimeID, old.LaunchID, outcome)
+				require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, "execution-result.json", receipt))
+			}
+			if late == "invalid" {
+				require.Error(t, db.AdoptExecution(ctx, old, newer))
+				assertLockedBaseline(t, old)
+			} else {
+				adopt(t, old, newer)
+				require.True(t, newer.RecoverOnly)
+				require.Equal(t, old.LaunchID, newer.LaunchID)
+				require.NotEqual(t, old.RuntimeID, newer.RuntimeID)
+				require.Error(t, db.CompleteOrdinaryRecovery(ctx, newer, func(context.Context) (string, error) {
+					return "", errors.New("fresh settled receipt and common table checkpoint unavailable")
+				}))
+				assertLockedBaseline(t, newer)
+				require.NoError(t, db.CompleteOrdinaryRecovery(ctx, newer, func(context.Context) (string, error) {
+					return recoveryDBFinal, nil
+				}))
+				require.NoError(t, db.ReleaseJobExecution(ctx, newer))
+			}
+			unchanged, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryOriginFile, false)
+			require.NoError(t, err)
+			require.Equal(t, immutable, unchanged)
+		})
+	}
+	t.Run("missing helper pin and receipt permit only fresh recovery ownership", func(t *testing.T) {
+		old, helper := fixture(t)
+		adopt(t, old, helper)
+		origin, _, _, err := utils.ReadOrdinaryRecoveryOrigin(ctx, helper)
+		require.NoError(t, err)
+		require.NoError(t, utils.PreserveOrdinaryRecoveryServer(ctx, helper, origin))
+		_, stableDir := utils.GetWorkflowDirAndSubDir(old.WorkflowID, types.Sync)
+		immutable, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryOriginFile, false)
+		require.NoError(t, err)
+		third := executionTestRequest(old.WorkflowID, "catalog-recovery-run", types.Sync)
+		require.NoError(t, db.AdoptExecution(ctx, helper, third))
+		require.NoError(t, db.AcquireJobExecution(ctx, third))
+		r, won, err := db.AdmitExecution(ctx, third, "catalog-recovery-attempt", "catalog-recovery-runtime")
+		require.NoError(t, err)
+		require.True(t, won)
+		require.Equal(t, "recovery", r.Outcome)
+		require.Equal(t, old.LaunchID, r.LaunchID)
+		require.NotEqual(t, helper.RuntimeID, r.RuntimeID)
+		require.NotEqual(t, old.RuntimeID, r.RuntimeID)
+		require.Error(t, db.ReleaseJobExecution(ctx, old))
+		require.Error(t, db.ReleaseJobExecution(ctx, helper))
+		require.Error(t, db.ReleaseJobExecution(ctx, third))
+		require.Error(t, db.CompleteOrdinaryRecovery(ctx, helper, func(context.Context) (string, error) {
+			return recoveryDBFinal, nil
+		}))
+		job, err := db.GetJobData(ctx, 42)
+		require.NoError(t, err)
+		require.Equal(t, recoveryDBBaseline, job.State)
+		unchanged, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryOriginFile, false)
+		require.NoError(t, err)
+		require.Equal(t, immutable, unchanged)
 	})
 }

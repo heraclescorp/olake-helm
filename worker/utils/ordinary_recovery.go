@@ -32,12 +32,12 @@ type OrdinaryRecoveryServer struct {
 
 // Origin is create-only in the stable operation directory. Recovery runtimes
 // receive byte-identical copies; neither an activity retry nor an epoch reset
-// is allowed to move the trusted lower bound or replace the original receipt.
+// is allowed to move the trusted lower bound or replace a bound original receipt.
 type OrdinaryRecoveryOrigin struct {
 	Version               int    `json:"version"`
 	OriginalExecutionID   string `json:"original_execution_id"`
 	OriginalLaunchID      string `json:"original_launch_id"`
-	OriginalReceiptSHA256 string `json:"original_receipt_sha256"`
+	OriginalReceiptSHA256 string `json:"original_receipt_sha256"` // Empty when no original receipt was available.
 	SourceSHA256          string `json:"source_sha256"`
 	DestinationSHA256     string `json:"destination_sha256"`
 	CatalogSHA256         string `json:"catalog_sha256"`
@@ -112,6 +112,51 @@ func ReadOrdinaryRuntimeConfigs(ctx context.Context, req *types.ExecutionRequest
 	return files, nil
 }
 
+// Missing receipts permit only recovery admission. A frozen unbound origin may
+// observe late known outcomes without treating them as recovery settlement.
+func ReadOrdinaryRecoveryOriginalReceipt(ctx context.Context, req *types.ExecutionRequest, allowKnownOutcomes bool) (string, error) {
+	original := *req
+	original.Controlled, original.RuntimeID = true, req.LaunchID
+	_, dir := GetExecutionDirAndSubDir(&original)
+	receipt, err := storage.ReadFile(ctx, dir, "execution-result.json", false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var proof struct {
+		Version     int    `json:"version"`
+		ExecutionID string `json:"execution_id"`
+		LaunchID    string `json:"launch_id"`
+		Command     string `json:"command"`
+		Outcome     string `json:"outcome"`
+		StateSHA256 string `json:"state_sha256"`
+	}
+	if err := json.Unmarshal([]byte(receipt), &proof); err != nil {
+		return "", err
+	}
+	if proof.Version != 1 || req.LaunchID == "" || proof.ExecutionID != req.LaunchID || proof.LaunchID != req.LaunchID || proof.Command != "sync" {
+		return "", fmt.Errorf("ordinary recovery requires the original identity-bound sync receipt when present")
+	}
+	if proof.Outcome != "unknown" {
+		if !allowKnownOutcomes || (proof.Outcome != "settled" && proof.Outcome != "not_started") {
+			return "", fmt.Errorf("ordinary recovery original receipt has an unsupported outcome")
+		}
+		if proof.Outcome == "settled" {
+			if len(proof.StateSHA256) != sha256.Size*2 {
+				return "", fmt.Errorf("settled original receipt has an invalid state digest")
+			}
+			for _, digit := range proof.StateSHA256 {
+				if (digit < '0' || digit > '9') && (digit < 'a' || digit > 'f') {
+					return "", fmt.Errorf("settled original receipt has an invalid state digest")
+				}
+			}
+		}
+	}
+	return receipt, nil
+}
+
 func ReadOrdinaryRecoveryOrigin(ctx context.Context, req *types.ExecutionRequest) (OrdinaryRecoveryOrigin, string, map[string]string, error) {
 	var origin OrdinaryRecoveryOrigin
 	_, dir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
@@ -133,10 +178,7 @@ func ReadOrdinaryRecoveryOrigin(ctx context.Context, req *types.ExecutionRequest
 	if err != nil {
 		return origin, "", nil, err
 	}
-	original := *req
-	original.Controlled, original.RuntimeID = true, origin.OriginalExecutionID
-	_, originalDir := GetExecutionDirAndSubDir(&original)
-	receipt, err := storage.ReadFile(ctx, originalDir, "execution-result.json", false)
+	receipt, err := ReadOrdinaryRecoveryOriginalReceipt(ctx, req, origin.OriginalReceiptSHA256 == "")
 	if err != nil {
 		return origin, "", nil, err
 	}
@@ -148,7 +190,7 @@ func ReadOrdinaryRecoveryOrigin(ctx context.Context, req *types.ExecutionRequest
 	if err != nil {
 		return origin, "", nil, err
 	}
-	if origin.OriginalReceiptSHA256 != RawSHA256(receipt) || origin.SourceSHA256 != RawSHA256(files["source.json"]) || origin.DestinationSHA256 != RawSHA256(files["destination.json"]) || origin.CatalogSHA256 != catalog || origin.BaselineStateSHA256 != stateSHA {
+	if (origin.OriginalReceiptSHA256 != "" && (receipt == "" || origin.OriginalReceiptSHA256 != RawSHA256(receipt))) || origin.SourceSHA256 != RawSHA256(files["source.json"]) || origin.DestinationSHA256 != RawSHA256(files["destination.json"]) || origin.CatalogSHA256 != catalog || origin.BaselineStateSHA256 != stateSHA {
 		return origin, "", nil, fmt.Errorf("ordinary recovery origin evidence changed")
 	}
 	if _, _, err := OrdinaryRecoverySelection(files, baseline); err != nil {
@@ -342,50 +384,31 @@ func ValidateOrdinaryRecoveryServer(data string, origin OrdinaryRecoveryOrigin) 
 	return server, nil
 }
 
-// The connector creates this companion durably before its first destination
-// barrier. Capture it after exact retirement so the next runtime cannot silently
-// repin an interrupted recovery to a different PostgreSQL cluster or slot.
+// Preserve every observed standalone identity pin after exact retirement. Missing
+// pins are reconstructed by connector catalog preflight, never by old receipts.
 func PreserveOrdinaryRecoveryServer(ctx context.Context, req *types.ExecutionRequest, origin OrdinaryRecoveryOrigin) error {
-	if req.RuntimeID == req.LaunchID {
-		return nil
-	}
-	_, runtimeDir := GetExecutionDirAndSubDir(req)
-	data, err := storage.ReadFile(ctx, runtimeDir, OrdinaryRecoveryServerFile, false)
-	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		// A positively unstarted successor made no barriers and therefore
-		// need not have obtained a live server identity yet. This is not
-		// settlement of the original unknown operation.
-		receipt, readErr := storage.ReadFile(ctx, runtimeDir, "execution-result.json", false)
-		if readErr != nil {
-			return readErr
-		}
-		var proof struct {
-			Version     int    `json:"version"`
-			ExecutionID string `json:"execution_id"`
-			LaunchID    string `json:"launch_id"`
-			Command     string `json:"command"`
-			Outcome     string `json:"outcome"`
-		}
-		if err := json.Unmarshal([]byte(receipt), &proof); err != nil {
-			return err
-		}
-		if proof.Version != 1 || proof.ExecutionID != req.RuntimeID || proof.LaunchID != req.LaunchID || proof.Command != "sync" || proof.Outcome != "not_started" {
-			return fmt.Errorf("interrupted ordinary recovery has no durable PostgreSQL server pin")
-		}
-		return nil
-	}
-	server, err := ValidateOrdinaryRecoveryServer(data, origin)
-	if err != nil {
-		return err
-	}
+	var server *OrdinaryRecoveryServer
 	_, stableDir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
-	if _, err := storage.CreateFileIfAbsent(ctx, stableDir, OrdinaryRecoveryServerFile, data); err != nil {
-		return err
+	if req.RuntimeID != req.LaunchID {
+		_, runtimeDir := GetExecutionDirAndSubDir(req)
+		data, err := storage.ReadFile(ctx, runtimeDir, OrdinaryRecoveryServerFile, false)
+		if err == nil {
+			pin, err := ValidateOrdinaryRecoveryServer(data, origin)
+			if err != nil {
+				return err
+			}
+			server = &pin
+			if _, err := storage.CreateFileIfAbsent(ctx, stableDir, OrdinaryRecoveryServerFile, data); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 	}
 	stored, err := storage.ReadFile(ctx, stableDir, OrdinaryRecoveryServerFile, false)
+	if errors.Is(err, fs.ErrNotExist) && server == nil {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -393,7 +416,7 @@ func PreserveOrdinaryRecoveryServer(ctx context.Context, req *types.ExecutionReq
 	if err != nil {
 		return err
 	}
-	if prior != server {
+	if server != nil && prior != *server {
 		return fmt.Errorf("PostgreSQL server identity changed between recovery epochs")
 	}
 	return nil
