@@ -81,6 +81,9 @@ func (e *enrollmentActivityExecutor) CleanupResync(context.Context, *types.Execu
 func (e *enrollmentActivityExecutor) RetireExecution(context.Context, *types.ExecutionRequest) error {
 	return nil
 }
+func (e *enrollmentActivityExecutor) PrepareOrdinaryRecovery(context.Context, *types.ExecutionRequest) error {
+	return context.Canceled
+}
 
 func activityEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, *enrollmentActivityDB) {
 	t.Helper()

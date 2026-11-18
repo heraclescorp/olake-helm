@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
+	"github.com/datazip-inc/olake-helm/worker/constants"
 	"github.com/datazip-inc/olake-helm/worker/storage"
 	"github.com/datazip-inc/olake-helm/worker/types"
 )
@@ -52,6 +54,14 @@ func StateSHA256(state string) (string, error) {
 }
 
 func ReadExecutionFence(ctx context.Context, req *types.ExecutionRequest) error {
+	return readExecutionFence(ctx, req, "open")
+}
+
+func RequireClosedExecutionFence(ctx context.Context, req *types.ExecutionRequest) error {
+	return readExecutionFence(ctx, req, "closed")
+}
+
+func readExecutionFence(ctx context.Context, req *types.ExecutionRequest, state string) error {
 	if !req.Controlled || req.RuntimeID == "" {
 		return fmt.Errorf("positive execution fence requires controlled runtime identity")
 	}
@@ -64,8 +74,8 @@ func ReadExecutionFence(ctx context.Context, req *types.ExecutionRequest) error 
 	if err := json.Unmarshal([]byte(data), &fence); err != nil {
 		return fmt.Errorf("invalid execution fence: %w", err)
 	}
-	if fence.Version != 1 || fence.ExecutionID != req.RuntimeID || fence.State != "open" {
-		return fmt.Errorf("execution fence is not positively open for runtime %s", req.RuntimeID)
+	if fence.Version != 1 || fence.ExecutionID != req.RuntimeID || fence.State != state {
+		return fmt.Errorf("execution fence is not positively %s for runtime %s", state, req.RuntimeID)
 	}
 	return nil
 }
@@ -96,7 +106,7 @@ func SetExecutionArgs(req *types.ExecutionRequest) {
 	for i := 0; i < len(req.Args); i++ {
 		flag, _, inline := strings.Cut(req.Args[i], "=")
 		switch flag {
-		case "--execution-id", "--execution-fence", "--resync-launch-id":
+		case "--execution-id", "--execution-fence", "--execution-launch-id", "--resync-launch-id", "--ordinary-recovery-origin", "--ordinary-recovery-result":
 			if !inline && i+1 < len(req.Args) {
 				i++
 			}
@@ -111,6 +121,11 @@ func SetExecutionArgs(req *types.ExecutionRequest) {
 	}
 	_, dir := GetExecutionDirAndSubDir(req)
 	req.Args = append(req.Args, "--execution-id", req.RuntimeID, "--execution-fence", storage.ExecutionFenceLocation(dir, ExecutionFenceFile))
+	if req.Command == types.Sync && req.RecoverOnly {
+		req.Args = append(req.Args, "--execution-launch-id", req.LaunchID,
+			"--ordinary-recovery-origin", filepath.Join(constants.ContainerMountDir, OrdinaryRecoveryOriginFile),
+			"--ordinary-recovery-result", filepath.Join(constants.ContainerMountDir, OrdinaryRecoveryResultFile))
+	}
 	if req.Command == types.Resync {
 		req.Args = append(req.Args, "--resync-launch-id", req.LaunchID)
 		if req.RecoverOnly {

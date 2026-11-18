@@ -122,6 +122,7 @@ func TestCatalogEnrollmentLocalPostgres(t *testing.T) {
 	}
 	runExecutionConcurrencyTests(t, ctx, db, reset, state)
 	runJSONBHandoffTests(t, ctx, db, reset)
+	runOrdinaryRecoveryDBTests(t, ctx, db, reset)
 	enrollmentReq := executionTestRequest("ordinary-sync", "enrollment-run", types.Sync)
 	t.Run("ordinary job loading without automatic enrollment", func(t *testing.T) {
 		reset(t)

@@ -61,7 +61,12 @@ func (a *Activity) acquireJobExecution(ctx context.Context, req *types.Execution
 	executionRequestFromRecord(&old, r)
 	if req.Command != types.Resync && (r.LaunchID != "" || !r.Controlled) {
 		if err := a.executor.CleanupAndPersistState(ctx, &old); err != nil {
-			return fmt.Errorf("ordinary execution retirement is not proven: %w", err)
+			if req.Command != types.Sync || !r.Controlled {
+				return fmt.Errorf("ordinary execution retirement is not proven: %w", err)
+			}
+			if recoveryErr := a.executor.PrepareOrdinaryRecovery(ctx, &old); recoveryErr != nil {
+				return fmt.Errorf("ordinary execution remains unknown (%v); recovery blocked: %w", err, recoveryErr)
+			}
 		}
 	} else {
 		// A canceled launch can already have an exact not_published receipt.

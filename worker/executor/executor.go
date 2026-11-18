@@ -71,6 +71,11 @@ func (a *AbstractExecutor) Execute(ctx context.Context, req *types.ExecutionRequ
 	if utils.IsAsyncCommand(req.Command) && req.Controlled && req.RuntimeID == "" {
 		return nil, fmt.Errorf("controlled asynchronous execution requires durable runtime identity")
 	}
+	if req.Command == types.Sync && req.RecoverOnly {
+		if err := a.ordinaryRecoveryInputs(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 	utils.SetExecutionArgs(req)
 	log := logger.Log(ctx)
 	subdir, workdir := utils.GetExecutionDirAndSubDir(req)
@@ -221,6 +226,11 @@ func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *type
 			outcome = "legacy_completed"
 			return a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, req.RunID, state)
 		}
+		if req.Command == types.Sync && req.RecoverOnly {
+			// Recovery completion atomically persists the verified checkpoint and
+			// closes its owner row. Do not use ordinary two-step persistence.
+			return nil
+		}
 		state, confirmedOutcome, err := confirmedExecutionResult(ctx, req)
 		if err != nil {
 			return err
@@ -233,6 +243,17 @@ func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *type
 	})
 	if err != nil {
 		return err
+	}
+	if req.Command == types.Sync && req.RecoverOnly {
+		store, ok := a.db.(interface {
+			CompleteOrdinaryRecovery(context.Context, *types.ExecutionRequest, func(context.Context) (string, error)) error
+		})
+		if !ok {
+			return fmt.Errorf("ordinary recovery requires atomic checkpoint/owner persistence")
+		}
+		return store.CompleteOrdinaryRecovery(ctx, req, func(ctx context.Context) (string, error) {
+			return confirmedOrdinaryRecovery(ctx, req)
+		})
 	}
 	return a.db.FinishExecution(ctx, req, outcome)
 }
