@@ -312,10 +312,12 @@ func TestOrdinaryRecoveryRetriesAttachWithoutRewritingAndPinServerAcrossEpochs(t
 }
 
 func TestOrdinaryRecoveryInterruptedEpochRequiresPinnedServerOrPositiveNoStart(t *testing.T) {
-	for _, outcome := range []string{"unknown", "not_started"} {
+	for _, outcome := range []string{"unknown", "not_started", "missing"} {
 		t.Run(outcome, func(t *testing.T) {
 			a, store, req, _ := prepareRecoveryRuntime(t)
-			writeOrdinaryExecutionProof(t, context.Background(), req, outcome, "")
+			if outcome != "missing" {
+				writeOrdinaryExecutionProof(t, context.Background(), req, outcome, "")
+			}
 			err := a.PrepareOrdinaryRecovery(context.Background(), req)
 			if outcome == "not_started" {
 				require.NoError(t, err)
