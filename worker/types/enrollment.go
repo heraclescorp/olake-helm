@@ -63,6 +63,7 @@ type EnrollmentDefaults struct {
 	Normalization      *bool  `json:"normalization"`
 	AppendMode         *bool  `json:"append_mode"`
 	UpdateType         string `json:"update_type"`
+	MergeStrategy      string `json:"merge_strategy,omitempty"`
 	SyncNewColumns     *bool  `json:"sync_new_columns"`
 	DropRemovedColumns *bool  `json:"drop_removed_columns,omitempty"`
 }
@@ -116,6 +117,40 @@ func (j JobData) AutoTableEnrollment() (*EnrollmentPolicy, error) {
 	if defaults.Normalization == nil || defaults.AppendMode == nil || defaults.SyncNewColumns == nil ||
 		(defaults.UpdateType != "eq" && defaults.UpdateType != "pos" && defaults.UpdateType != "dv") {
 		return nil, fmt.Errorf("automatic table enrollment requires explicit valid defaults")
+	}
+	// An omitted strategy is the historical MOR default. An explicit empty or
+	// null value is not a strategy and must not silently become MOR.
+	var raw struct {
+		Policy struct {
+			Defaults map[string]json.RawMessage `json:"defaults"`
+		} `json:"auto_table_enrollment"`
+	}
+	if err := json.Unmarshal([]byte(j.AdvancedSettings), &raw); err != nil {
+		return nil, fmt.Errorf("invalid automatic enrollment defaults")
+	}
+	if _, present := raw.Policy.Defaults["merge_strategy"]; present && defaults.MergeStrategy == "" {
+		return nil, fmt.Errorf("automatic enrollment merge_strategy must be merge-on-read or copy-on-write")
+	}
+	if defaults.MergeStrategy != "" && defaults.MergeStrategy != "merge-on-read" && defaults.MergeStrategy != "copy-on-write" {
+		return nil, fmt.Errorf("automatic enrollment merge_strategy must be merge-on-read or copy-on-write")
+	}
+	if defaults.MergeStrategy == "copy-on-write" {
+		if !*defaults.Normalization || *defaults.AppendMode {
+			return nil, fmt.Errorf("copy-on-write enrollment requires normalized upsert defaults")
+		}
+		source, err := decodeCatalog(j.Source)
+		if err != nil {
+			return nil, fmt.Errorf("copy-on-write enrollment requires valid PostgreSQL source configuration")
+		}
+		if method, exists := source["update_method"]; exists && method != nil {
+			updateMethod, ok := method.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("copy-on-write enrollment requires source-based TOAST recovery")
+			}
+			if value, exists := updateMethod["toast_value_source"]; exists && value != nil && value != "" && value != "source" {
+				return nil, fmt.Errorf("copy-on-write enrollment requires source-based TOAST recovery")
+			}
+		}
 	}
 	available := j.Streams
 	if j.AvailableStreams != "" && j.SelectedStreams != "" {
@@ -363,8 +398,19 @@ func (j JobData) ValidateEnrollment(result EnrollmentResult) (JobData, error) {
 		if override, exists := metadata["destination_database"]; exists && override != approved[id.Namespace] {
 			return JobData{}, fmt.Errorf("enrollment selection overrides the approved destination")
 		}
+		strategy, exists := metadata["merge_strategy"]
+		if policy.Defaults.MergeStrategy == "copy-on-write" {
+			if !exists || strategy != "copy-on-write" {
+				return JobData{}, fmt.Errorf("enrollment addition must explicitly use approved copy-on-write strategy")
+			}
+			if err := validateCOWEnrollment(stream, metadata); err != nil {
+				return JobData{}, err
+			}
+		} else if exists && strategy != "merge-on-read" {
+			return JobData{}, fmt.Errorf("enrollment addition does not match approved merge-on-read strategy")
+		}
 	}
-	if !*policy.Defaults.AppendMode && (policy.Defaults.UpdateType == "pos" || policy.Defaults.UpdateType == "dv") {
+	if policy.Defaults.MergeStrategy != "copy-on-write" && !*policy.Defaults.AppendMode && (policy.Defaults.UpdateType == "pos" || policy.Defaults.UpdateType == "dv") {
 		var settings map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(j.AdvancedSettings), &settings); err != nil {
 			return JobData{}, fmt.Errorf("invalid advanced settings JSON")
@@ -377,6 +423,88 @@ func (j JobData) ValidateEnrollment(result EnrollmentResult) (JobData, error) {
 		proposed.AdvancedSettings = string(encoded)
 	}
 	return proposed, nil
+}
+
+// The connector supplies discovery metadata; only its source-defined keys,
+// not user-selected deduplication columns or OLake metadata, establish COW
+// eligibility. Validate the proposal independently before committing it.
+func validateCOWEnrollment(stream, metadata map[string]any) error {
+	if stream["supports_iceberg_copy_on_write"] != true || stream["sync_mode"] != "cdc" {
+		return fmt.Errorf("copy-on-write enrollment requires a COW-capable CDC stream")
+	}
+	if mode, exists := metadata["sync_mode"]; exists && mode != "" && mode != "cdc" {
+		return fmt.Errorf("copy-on-write enrollment cannot override the CDC sync mode")
+	}
+	if table, ok := stream["destination_table"].(string); !ok || table == "" || table != enrollmentDestinationTable(stream["name"].(string)) {
+		return fmt.Errorf("copy-on-write enrollment requires the canonical source table destination")
+	} else if override, exists := metadata["destination_table"]; exists && override != "" && override != table {
+		return fmt.Errorf("copy-on-write enrollment cannot override the destination table")
+	}
+	for _, key := range []string{"chunk_column", "partition_regex", "filter", "cursor_field"} {
+		if value, exists := metadata[key]; exists && value != "" {
+			return fmt.Errorf("copy-on-write enrollment has an unapproved %s override", key)
+		}
+	}
+	if value, exists := metadata["use_source_column_names"]; exists && value != false {
+		return fmt.Errorf("copy-on-write enrollment has unapproved column naming")
+	}
+	for _, key := range []string{"filter_config", "dedup_keys", "sort_order"} {
+		if value, exists := metadata[key]; exists && value != nil {
+			return fmt.Errorf("copy-on-write enrollment has an unapproved %s override", key)
+		}
+	}
+	schema, _ := stream["type_schema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	keys, ok := stream["source_defined_primary_key"].([]any)
+	if !ok || len(keys) == 0 || len(properties) == 0 {
+		return fmt.Errorf("copy-on-write enrollment requires source-defined primary keys and their source schema")
+	}
+	seen := make(map[string]bool, len(keys))
+	for _, value := range keys {
+		key, ok := value.(string)
+		property, propertyOK := properties[key].(map[string]any)
+		types, typesOK := property["type"].([]any)
+		if !ok || strings.TrimSpace(key) == "" || seen[key] || !propertyOK || !typesOK || len(types) == 0 {
+			return fmt.Errorf("copy-on-write enrollment requires genuine source-defined primary keys")
+		}
+		if olake, exists := property["olake_column"]; exists && olake != false {
+			return fmt.Errorf("copy-on-write enrollment requires genuine source-defined primary keys")
+		}
+		seen[key] = true
+		for _, typ := range types {
+			name, valid := typ.(string)
+			if !valid || name == "" || name == "null" {
+				return fmt.Errorf("copy-on-write enrollment requires non-null source primary keys")
+			}
+		}
+	}
+	columns, _ := metadata["selected_columns"].(map[string]any)
+	selected, ok := columns["columns"].([]any)
+	if !ok || len(selected) != len(properties) {
+		return fmt.Errorf("copy-on-write enrollment must select every discovered column")
+	}
+	selectedNames := make(map[string]bool, len(selected))
+	for _, value := range selected {
+		name, ok := value.(string)
+		if !ok || selectedNames[name] || properties[name] == nil {
+			return fmt.Errorf("copy-on-write enrollment must select every discovered column")
+		}
+		selectedNames[name] = true
+	}
+	return nil
+}
+
+// Match the connector's GenerateDestinationDetails table-name normalization.
+func enrollmentDestinationTable(name string) string {
+	var result strings.Builder
+	for _, symbol := range strings.ToLower(name) {
+		if ('a' <= symbol && symbol <= 'z') || ('0' <= symbol && symbol <= '9') {
+			result.WriteByte(byte(symbol))
+		} else {
+			result.WriteByte('_')
+		}
+	}
+	return result.String()
 }
 
 func preserveCatalogFields(before, after map[string]any, field string, legacy bool) error {

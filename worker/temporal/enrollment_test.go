@@ -391,3 +391,62 @@ func TestSyncRetryEnrollmentUsesActualOrdinaryLaunchBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestCOWEnrollmentPreflightAndSync(t *testing.T) {
+	const cowCatalog = `{"streams":[{"stream":{"namespace":"public","name":"old"}},{"stream":{"namespace":"public","name":"new","supports_iceberg_copy_on_write":true,"source_defined_primary_key":["id"],"type_schema":{"properties":{"id":{"type":["integer"]}}},"destination_database":"lake","destination_table":"new","sync_mode":"cdc"}}],"selected_streams":{"public":[{"stream_name":"new","normalization":true,"append_mode":false,"update_type":"pos","merge_strategy":"copy-on-write","selected_columns":{"columns":["id"],"sync_new_columns":false}}]}}`
+	for _, mode := range []string{"cow", "existing index", "no key skipped", "forged mode", "forged key"} {
+		t.Run(mode, func(t *testing.T) {
+			req, db := activityEnrollmentFixture(t)
+			db.job.AdvancedSettings = strings.Replace(db.job.AdvancedSettings, `"update_type":"pos"`, `"update_type":"pos","merge_strategy":"copy-on-write"`, 1)
+			if mode == "existing index" {
+				db.job.AdvancedSettings = strings.Replace(db.job.AdvancedSettings, `"index_required":false`, `"index_required":true`, 1)
+			}
+			settings, state := db.job.AdvancedSettings, db.job.State
+			var commands []types.Command
+			exec := &enrollmentActivityExecutor{execute: func(ctx context.Context, request *types.ExecutionRequest) (*types.ExecutorResponse, error) {
+				commands = append(commands, request.Command)
+				if request.Command == types.DiscoverNewTables {
+					for _, config := range request.Configs {
+						if config.Name == enrollmentPolicyFile {
+							var policy types.EnrollmentPolicy
+							require.NoError(t, json.Unmarshal([]byte(config.Data), &policy))
+							require.Equal(t, "copy-on-write", policy.Defaults.MergeStrategy)
+							require.Equal(t, "pos", policy.Defaults.UpdateType)
+						}
+					}
+					result := types.EnrollmentResult{Streams: cowCatalog, Enrolled: []types.EnrollmentID{{Namespace: "public", StreamName: "new"}}}
+					switch mode {
+					case "no key skipped":
+						result.Streams, result.Enrolled = activityOldCatalog, nil
+						result.Skipped = []types.EnrollmentSkip{{EnrollmentID: types.EnrollmentID{Namespace: "public", StreamName: "new"}, Reason: "upsert enrollment requires a stable source primary key"}}
+					case "forged mode":
+						result.Streams = strings.Replace(result.Streams, `"merge_strategy":"copy-on-write"`, `"merge_strategy":"merge-on-read"`, 1)
+					case "forged key":
+						result.Streams = strings.Replace(result.Streams, `"source_defined_primary_key":["id"]`, `"source_defined_primary_key":[]`, 1)
+					}
+					writeActivityEnrollmentResult(t, ctx, request, result)
+				} else {
+					require.Equal(t, mode == "existing index", request.IndexRequired)
+					require.Equal(t, 1, db.commits)
+				}
+				return &types.ExecutorResponse{}, nil
+			}}
+			a := &Activity{db: db, executor: exec}
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(a.SyncActivity)
+			_, err := env.ExecuteActivity(a.SyncActivity, req)
+			if strings.HasPrefix(mode, "forged") {
+				require.Error(t, err)
+				require.Zero(t, db.commits)
+				require.Equal(t, []types.Command{types.DiscoverNewTables}, commands)
+				require.Equal(t, activityOldCatalog, db.job.Streams)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []types.Command{types.DiscoverNewTables, types.Sync}, commands)
+			}
+			require.Equal(t, settings, db.job.AdvancedSettings)
+			require.Equal(t, state, db.job.State)
+		})
+	}
+}
