@@ -35,6 +35,9 @@ func (e *resyncCleanupExecutor) CleanupResync(context.Context, *types.ExecutionR
 func (e *resyncCleanupExecutor) RetireExecution(context.Context, *types.ExecutionRequest) error {
 	return nil
 }
+func (e *resyncCleanupExecutor) PrepareOrdinaryRecovery(context.Context, *types.ExecutionRequest) error {
+	return context.Canceled
+}
 
 type resyncScheduleHandle struct {
 	client.ScheduleHandle

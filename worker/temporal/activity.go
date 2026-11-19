@@ -25,6 +25,7 @@ type activityExecutor interface {
 	CleanupAndPersistState(context.Context, *types.ExecutionRequest) error
 	CleanupResync(context.Context, *types.ExecutionRequest, bool) error
 	RetireExecution(context.Context, *types.ExecutionRequest) error
+	PrepareOrdinaryRecovery(context.Context, *types.ExecutionRequest) error
 }
 
 type activityDatabase interface {
@@ -144,6 +145,32 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 		telemetry.TrackSyncEvent(telemetry.BasePayload(ctx, req), telemetry.TelemetryEventFailed, "")
 		errMsg := fmt.Sprintf("failed to get job data: %s", err)
 		return nil, temporal.NewNonRetryableApplicationError(errMsg, "DatabaseError", err)
+	}
+	if currentExecution.Outcome == "recovery" {
+		executionRequestFromRecord(req, currentExecution)
+		req.ConnectorType, req.Version = jobDetails.Driver, jobDetails.Version
+		indexRequired, err := jobDetails.IndexRequired()
+		if err != nil {
+			return nil, err
+		}
+		req.IndexRequired = indexRequired
+		if err := a.db.GuardExecution(ctx, req, func(ctx context.Context, _ *database.ExecutionRecord) error {
+			_, scheduleID := utils.SyncWorkflowAndScheduleID(req.ProjectID, req.JobID)
+			return a.tempClient.ScheduleClient().GetHandle(ctx, scheduleID).Pause(ctx, client.SchedulePauseOptions{Note: "Ordinary sync recovery; explicit operator resume required after proof-backed retirement"})
+		}); err != nil {
+			return nil, err
+		}
+		if err := a.prepareExecution(ctx, req); err != nil {
+			return nil, err
+		}
+		result, err := a.executor.Execute(ctx, req)
+		if ctx.Err() != nil {
+			return nil, temporal.NewCanceledError("ordinary sync recovery cancelled")
+		}
+		if err != nil {
+			return nil, temporal.NewNonRetryableApplicationError(err.Error(), "OrdinaryRecoveryFailed", err)
+		}
+		return result, nil
 	}
 
 	// mapping request type of deprecated workflow to new request type

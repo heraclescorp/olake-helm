@@ -81,6 +81,9 @@ func (e *enrollmentActivityExecutor) CleanupResync(context.Context, *types.Execu
 func (e *enrollmentActivityExecutor) RetireExecution(context.Context, *types.ExecutionRequest) error {
 	return nil
 }
+func (e *enrollmentActivityExecutor) PrepareOrdinaryRecovery(context.Context, *types.ExecutionRequest) error {
+	return context.Canceled
+}
 
 func activityEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, *enrollmentActivityDB) {
 	t.Helper()
@@ -125,6 +128,12 @@ func TestPreflightRequestUsesSourceImageIsolatedMetadataAndDefaultScheduling(t *
 			job.SelectedStreams = `{"selected_streams":{"public":[]}}`
 			job.Streams = ""
 		}
+		selection := &job.Streams
+		if split {
+			selection = &job.SelectedStreams
+		}
+		*selection = strings.Replace(*selection, `{`, `{"default_sort_order":[{"column":"created_at","direction":"asc","null_order":"nulls-last"}],"extension":{"keep":9007199254740993},`, 1)
+		*selection = strings.Replace(*selection, `"public":[]`, `"public":[{"stream_name":"old","sort_order":[]},{"stream_name":"unavailable","sort_order":[{"column":"id","direction":"desc","null_order":"nulls-first"}]}]`, 1)
 		policy, err := job.AutoTableEnrollment()
 		require.NoError(t, err)
 		preflight, err := enrollmentPreflightRequest(req, job, policy, "attempt-1")
@@ -139,6 +148,20 @@ func TestPreflightRequestUsesSourceImageIsolatedMetadataAndDefaultScheduling(t *
 		_, ordinaryDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 		_, preflightDir := utils.GetWorkflowDirAndSubDir(preflight.WorkflowID, preflight.Command)
 		require.NotEqual(t, ordinaryDir, preflightDir)
+		wire, err := json.Marshal(preflight)
+		require.NoError(t, err)
+		var decoded types.ExecutionRequest
+		require.NoError(t, json.Unmarshal(wire, &decoded))
+		configs := make(map[string]string)
+		for _, config := range decoded.Configs {
+			configs[config.Name] = config.Data
+		}
+		if split {
+			require.Equal(t, job.AvailableStreams, configs[constants.AvailableStreamsFile])
+			require.Equal(t, job.SelectedStreams, configs[constants.SelectedStreamsFile])
+		} else {
+			require.Equal(t, job.Streams, configs[constants.StreamsFile])
+		}
 		for _, config := range preflight.Configs {
 			require.NotEqual(t, "state.json", config.Name)
 		}

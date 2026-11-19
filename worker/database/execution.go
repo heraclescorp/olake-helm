@@ -91,7 +91,12 @@ func (db *DB) AcquireJobExecution(ctx context.Context, req *types.ExecutionReque
 				return err
 			}
 			if !active {
-				return ErrJobExecutionInactive
+				// Pause blocks fresh ingestion, not explicit same-operation
+				// reconciliation of a retained controlled ordinary launch.
+				retained, readErr := db.readExecution(ctx, tx, req.JobID, req.WorkflowID)
+				if readErr != nil || req.Command != types.Sync || !retained.Controlled || retained.LaunchID == "" || (retained.OwnerRunID == req.RunID && retained.Outcome != "recovery" && !(retained.Phase == "closed" && retained.Outcome == "retired")) {
+					return ErrJobExecutionInactive
+				}
 			}
 		}
 		// A trigger may atomically take the pending transfer. No public request can
@@ -169,6 +174,9 @@ func (db *DB) AdmitExecution(ctx context.Context, req *types.ExecutionRequest, a
 		launchID := r.LaunchID
 		if launchID == "" {
 			launchID = runtimeID
+		}
+		if r.Outcome == "recovery" && (!r.Controlled || runtimeID == "" || runtimeID == launchID) {
+			return fmt.Errorf("recovery admission requires a fresh controlled runtime")
 		}
 		_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET launch_id=$3,runtime_id=$4,launcher_attempt_id=$5,phase='admitted',updated_at=now() WHERE job_id=$1 AND workflow_id=$2 AND phase='unadmitted' AND owner_run_id=$6`, db.executionTable()), req.JobID, req.WorkflowID, launchID, runtimeID, attemptID, req.RunID)
 		if err != nil {
@@ -284,7 +292,7 @@ func (db *DB) FinishExecution(ctx context.Context, req *types.ExecutionRequest, 
 }
 
 // Caller has positively retired the old runtime while holding GuardExecution.
-// A fresh data launch is never admitted after adoption: only resync recovery.
+// A fresh data launch is never admitted after adoption: only bound recovery.
 func (db *DB) AdoptExecution(ctx context.Context, oldReq, newReq *types.ExecutionRequest) error {
 	if oldReq.RunID == "" || newReq.RunID == "" || oldReq.RunID == newReq.RunID || oldReq.WorkflowID != newReq.WorkflowID || oldReq.JobID != newReq.JobID {
 		return fmt.Errorf("epoch adoption requires distinct nonempty runs of the same operation")
@@ -300,8 +308,20 @@ func (db *DB) AdoptExecution(ctx context.Context, oldReq, newReq *types.Executio
 		if r.OwnerRunID != oldReq.RunID || (r.Phase != "closing" && r.Phase != "closed" && r.Phase != "handoff") {
 			return ErrExecutionClosed
 		}
+		ordinaryRecovery := newReq.Command == types.Sync && r.Controlled && r.LaunchID != "" && r.Phase == "closing"
+		if ordinaryRecovery {
+			if oldReq.RuntimeID != r.RuntimeID || oldReq.LaunchID != r.LaunchID || oldReq.ResourceID == "" || oldReq.ResourceID != r.ResourceID || oldReq.ResourceUID != r.ResourceUID {
+				return fmt.Errorf("ordinary recovery adoption requires the exact retired runtime identity")
+			}
+			if err := utils.RequireClosedExecutionFence(ctx, oldReq); err != nil {
+				return err
+			}
+			if err := db.ordinaryRecoveryBinding(ctx, tx, oldReq); err != nil {
+				return fmt.Errorf("ordinary recovery origin is not bound to saved job: %w", err)
+			}
+		}
 		retiredWithoutPublication := r.Phase == "closed" && (r.Outcome == "not_launched" || r.Outcome == "retired" || (newReq.Command == types.Resync && r.Outcome == "not_published"))
-		if retiredWithoutPublication || (r.LaunchID != "" && newReq.Command != types.Resync) {
+		if retiredWithoutPublication || (r.LaunchID != "" && newReq.Command != types.Resync && !ordinaryRecovery) {
 			if !retiredWithoutPublication && (r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "retired")) {
 				return fmt.Errorf("ordinary execution cannot retire without positive settled outcome proof")
 			}

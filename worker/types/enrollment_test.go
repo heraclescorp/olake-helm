@@ -13,7 +13,7 @@ import (
 const enrollmentTestSettings = `{"unknown":{"large":9007199254740993},"index_required":false,"target_query_engines":["snowflake"],"auto_table_enrollment":{"enabled":true,"schemas":[{"namespace":"public","destination_database":"lake:public"}],"defaults":{"normalization":true,"append_mode":false,"update_type":"pos","sync_new_columns":false}}}`
 const enrollmentOldDefinition = `{"stream":{"name":"old","namespace":"public","destination_database":"keep","destination_table":"old","default_stream_properties":{"normalization":false,"append_mode":true,"update_type":"eq"}},"unknown":{"retain":9007199254740993}}`
 const enrollmentExcludedDefinition = `{"stream":{"name":"excluded","namespace":"public","destination_database":"keep","destination_table":"excluded"}}`
-const enrollmentNewDefinition = `{"stream":{"name":"new","namespace":"public","destination_database":"lake:public","destination_table":"new","sync_mode":"cdc"}}`
+const enrollmentNewDefinition = `{"stream":{"name":"new","namespace":"public","supports_iceberg_sort_order":true,"destination_database":"lake:public","destination_table":"new","sync_mode":"cdc"}}`
 const enrollmentOldSelection = `{"stream_name":"old","normalization":false,"append_mode":true,"update_type":"eq","filter":"id > 10","unknown":{"retain":true},"selected_columns":{"columns":["id"],"sync_new_columns":true}}`
 const enrollmentNewSelection = `{"stream_name":"new","normalization":true,"append_mode":false,"update_type":"pos","selected_columns":{"columns":["id"],"sync_new_columns":false}}`
 
@@ -157,16 +157,18 @@ func TestEnrollmentRejectsCatalogEditsAndUndeclaredSelections(t *testing.T) {
 }
 
 func TestLegacyImplicitSelectionMaterializesWithoutChangingEffectiveSettings(t *testing.T) {
-	job, result := enrollmentFixture(false)
-	job.Streams = `{"streams":[` + enrollmentOldDefinition + `,` + enrollmentExcludedDefinition + `],"root_unknown":{"keep":true}}`
-	oldImplicit := `{"stream_name":"old","partition_regex":"","normalization":false,"append_mode":true,"update_type":"eq","use_source_column_names":false,"selected_columns":null}`
-	excludedImplicit := `{"stream_name":"excluded","partition_regex":"","normalization":false,"update_type":"eq","use_source_column_names":false,"selected_columns":null}`
-	result.Streams = `{"streams":[` + enrollmentOldDefinition + `,` + enrollmentExcludedDefinition + `,` + enrollmentNewDefinition + `],"selected_streams":{"public":[` + oldImplicit + `,` + excludedImplicit + `,` + enrollmentNewSelection + `]},"root_unknown":{"keep":true}}`
-	_, err := job.ValidateEnrollment(result)
-	require.NoError(t, err)
-	result.Streams = strings.Replace(result.Streams, `"selected_columns":null`, `"selected_columns":{"columns":["id"],"sync_new_columns":false}`, 1)
-	_, err = job.ValidateEnrollment(result)
-	require.Error(t, err, "materializing legacy selection must retain all future columns")
+	for _, defaultField := range []string{"", `"default_sort_order":[{"column":"created_at","direction":"asc","null_order":"nulls-last"}],`} {
+		job, result := enrollmentFixture(false)
+		job.Streams = `{` + defaultField + `"streams":[` + enrollmentOldDefinition + `,` + enrollmentExcludedDefinition + `],"root_unknown":{"keep":true}}`
+		oldImplicit := `{"stream_name":"old","partition_regex":"","normalization":false,"append_mode":true,"update_type":"eq","use_source_column_names":false,"selected_columns":null}`
+		excludedImplicit := `{"stream_name":"excluded","partition_regex":"","normalization":false,"update_type":"eq","use_source_column_names":false,"selected_columns":null}`
+		result.Streams = `{` + defaultField + `"streams":[` + enrollmentOldDefinition + `,` + enrollmentExcludedDefinition + `,` + enrollmentNewDefinition + `],"selected_streams":{"public":[` + oldImplicit + `,` + excludedImplicit + `,` + enrollmentNewSelection + `]},"root_unknown":{"keep":true}}`
+		_, err := job.ValidateEnrollment(result)
+		require.NoError(t, err)
+		result.Streams = strings.Replace(result.Streams, `"selected_columns":null`, `"selected_columns":{"columns":["id"],"sync_new_columns":false}`, 1)
+		_, err = job.ValidateEnrollment(result)
+		require.Error(t, err, "materializing legacy selection must retain all future columns")
+	}
 }
 
 func TestEnrollmentPolicyAndIndexDefaults(t *testing.T) {
@@ -234,4 +236,92 @@ func TestLegacyNullSelectionAndUnsupportedConnectors(t *testing.T) {
 	job.Driver, job.DestinationDriver = "postgres", "parquet"
 	_, err = job.AutoTableEnrollment()
 	require.Error(t, err)
+}
+
+func TestEnrollmentPreservesSortPoliciesAndNewTablesInherit(t *testing.T) {
+	const preset = `[{"column":"created_at","direction":"asc","null_order":"nulls-last"}]`
+	const custom = `[{"column":"id","direction":"desc","null_order":"nulls-first"},{"column":"created_at","direction":"asc","null_order":"nulls-last"}]`
+	for _, split := range []bool{false, true} {
+		for _, defaultOrder := range []string{"", `[]`, preset} {
+			for _, override := range []string{"", `[]`, custom} {
+				job, result := enrollmentFixture(split)
+				before, after := &job.Streams, &result.Streams
+				if split {
+					before, after = &job.SelectedStreams, &result.SelectedStreams
+				}
+				for _, catalog := range []*string{before, after} {
+					if defaultOrder != "" {
+						*catalog = strings.Replace(*catalog, `{`, `{"default_sort_order":`+defaultOrder+`,`, 1)
+					}
+					if override != "" {
+						*catalog = strings.Replace(*catalog, `"stream_name":"old"`, `"stream_name":"old","sort_order":`+override, 1)
+					}
+				}
+				wire, err := json.Marshal(result)
+				require.NoError(t, err)
+				var decoded EnrollmentResult
+				require.NoError(t, json.Unmarshal(wire, &decoded))
+				proposed, err := job.ValidateEnrollment(decoded)
+				require.NoError(t, err)
+				require.Equal(t, result.Streams, proposed.Streams)
+				if split {
+					require.Equal(t, job.Streams, proposed.Streams)
+					require.Equal(t, result.AvailableStreams, proposed.AvailableStreams)
+				}
+				selected := proposed.Streams
+				if split {
+					selected = proposed.SelectedStreams
+					require.Equal(t, result.SelectedStreams, selected)
+				}
+				var catalog struct {
+					Default json.RawMessage `json:"default_sort_order"`
+					Groups  map[string][]struct {
+						Name  string          `json:"stream_name"`
+						Order json.RawMessage `json:"sort_order"`
+					} `json:"selected_streams"`
+				}
+				require.NoError(t, json.Unmarshal([]byte(selected), &catalog))
+				require.Equal(t, defaultOrder, string(catalog.Default))
+				for _, stream := range catalog.Groups["public"] {
+					if stream.Name == "old" {
+						require.Equal(t, override, string(stream.Order))
+					} else if stream.Name == "new" {
+						require.Empty(t, stream.Order, "enrolled tables must inherit rather than materializing the current default")
+					}
+				}
+				require.Equal(t, job.State, proposed.State)
+			}
+		}
+	}
+}
+
+func TestEnrollmentSortPolicyEditsStayFenced(t *testing.T) {
+	const preset = `[{"column":"created_at","direction":"asc","null_order":"nulls-last"}]`
+	for _, split := range []bool{false, true} {
+		for _, mutation := range []string{"remove default", "change default", "remove override", "change override"} {
+			t.Run(map[bool]string{false: "legacy/", true: "split/"}[split]+mutation, func(t *testing.T) {
+				job, result := enrollmentFixture(split)
+				before, after := &job.Streams, &result.Streams
+				if split {
+					before, after = &job.SelectedStreams, &result.SelectedStreams
+				}
+				for _, catalog := range []*string{before, after} {
+					*catalog = strings.Replace(*catalog, `{`, `{"default_sort_order":`+preset+`,`, 1)
+					*catalog = strings.Replace(*catalog, `"stream_name":"old"`, `"stream_name":"old","sort_order":[]`, 1)
+				}
+				switch mutation {
+				case "remove default":
+					*after = strings.Replace(*after, `"default_sort_order":`+preset+`,`, "", 1)
+				case "change default":
+					*after = strings.Replace(*after, `"default_sort_order":`+preset, `"default_sort_order":[]`, 1)
+				case "remove override":
+					*after = strings.Replace(*after, `,"sort_order":[]`, "", 1)
+				case "change override":
+					*after = strings.Replace(*after, `"sort_order":[]`, `"sort_order":`+preset, 1)
+				}
+				_, err := job.ValidateEnrollment(result)
+				require.Error(t, err)
+			})
+		}
+	}
 }
