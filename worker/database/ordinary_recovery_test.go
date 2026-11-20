@@ -22,6 +22,7 @@ import (
 const recoveryDBCatalog = `{"streams":[{"stream":{"namespace":"public","name":"old","sync_mode":"cdc","source_defined_primary_key":["id"]}}],"selected_streams":{"public":[{"stream_name":"old"}]}}`
 const recoveryDBBaseline = `{"type":"GLOBAL","global":{"state":{"lsn":"0/100"},"streams":["public.old"]},"streams":[]}`
 const recoveryDBFinal = `{"type":"GLOBAL","global":{"state":{"lsn":"0/200"},"streams":["public.old"]},"streams":[]}`
+const recoveryDBBackfill = `{"type":"GLOBAL","global":{"state":{"lsn":"0/100"},"streams":[]},"streams":[{"stream":"old","namespace":"public","sync_mode":"cdc","state":{"backfill_plan":[{"min":null,"max":null}],"resume_plan":[{"min":null,"max":null}],"chunks":[{"min":null,"max":null}],"backfill_table":{"table_uuid":"original-table","shape_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}]}`
 
 // Runs inside TestCatalogEnrollmentLocalPostgres's isolated real PostgreSQL
 // schema. No sqlmock: owner races, rollback and advisory locks use real sessions.
@@ -30,11 +31,17 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 	viper.Set(constants.EnvStorageMode, constants.StorageModeNFS)
 	viper.Set(constants.EnvKubernetesServiceHost, "")
 	defer func() { viper.Set(constants.EnvStorageMode, mode); viper.Set(constants.EnvKubernetesServiceHost, kube) }()
-	fixtureWithReceipt := func(t *testing.T, bindReceipt bool) (*types.ExecutionRequest, *types.ExecutionRequest) {
+	fixtureWithMode := func(t *testing.T, bindReceipt, backfill bool) (*types.ExecutionRequest, *types.ExecutionRequest) {
 		t.Helper()
 		reset(t)
 		_, err := db.client.ExecContext(ctx, `UPDATE enrollment_job SET streams_config=$1,state=$2 WHERE id=42`, recoveryDBCatalog, recoveryDBBaseline)
 		require.NoError(t, err)
+		baseline := recoveryDBBaseline
+		if backfill {
+			_, err := db.client.ExecContext(ctx, `UPDATE enrollment_source SET config='{"host":"source","update_method":{"replication_slot":"slot"}}'; UPDATE enrollment_job SET state='{}' WHERE id=42`)
+			require.NoError(t, err)
+			baseline = recoveryDBBackfill
+		}
 		job, err := db.GetJobData(ctx, 42)
 		require.NoError(t, err)
 		id := fmt.Sprintf("ordinary-recovery-%d", time.Now().UnixNano())
@@ -55,12 +62,23 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 			require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, "execution-result.json", receipt))
 			receiptSHA = utils.RawSHA256(receipt)
 		}
-		require.NoError(t, storage.WriteFileAtomic(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, recoveryDBBaseline))
 		catalogSHA, err := utils.OrdinaryCatalogSHA256(files)
 		require.NoError(t, err)
-		stateSHA, err := utils.StateSHA256(recoveryDBBaseline)
+		stateSHA, err := utils.StateSHA256(baseline)
 		require.NoError(t, err)
 		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: old.RuntimeID, OriginalLaunchID: old.LaunchID, OriginalReceiptSHA256: receiptSHA, SourceSHA256: utils.RawSHA256(job.Source), DestinationSHA256: utils.RawSHA256(job.Destination), CatalogSHA256: catalogSHA, BaselineStateSHA256: stateSHA}
+		if backfill {
+			candidate := utils.BackfillRecoveryCheckpoint{Version: 1, ExecutionID: old.RuntimeID, LaunchID: old.LaunchID, SourceSHA256: origin.SourceSHA256, DestinationSHA256: origin.DestinationSHA256, CatalogSHA256: catalogSHA, StateSHA256: stateSHA, State: json.RawMessage(baseline), ServerIdentity: `{"system_id":"123","timeline":1,"database":"db","slot_name":"slot","plugin":"pgoutput"}`, SlotName: "slot"}
+			data, err := json.Marshal(candidate)
+			require.NoError(t, err)
+			require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, utils.BackfillRecoveryCheckpointFile, string(data)))
+			_, err = storage.CreateFileIfAbsent(ctx, stableDir, utils.BackfillRecoveryCheckpointFile, string(data))
+			require.NoError(t, err)
+			origin.Backfill, origin.BackfillCheckpointSHA256 = true, utils.RawSHA256(string(data))
+			origin.SavedStateSHA256, err = utils.StateSHA256(job.State)
+			require.NoError(t, err)
+		}
+		require.NoError(t, storage.WriteFileAtomic(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, baseline))
 		data, err := json.Marshal(origin)
 		require.NoError(t, err)
 		require.NoError(t, storage.WriteFileAtomic(ctx, stableDir, utils.OrdinaryRecoveryOriginFile, string(data)))
@@ -68,6 +86,9 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		require.NoError(t, err)
 		require.NoError(t, utils.CloseExecutionFence(ctx, old))
 		return old, executionTestRequest(old.WorkflowID, "recovery-run", types.Sync)
+	}
+	fixtureWithReceipt := func(t *testing.T, bindReceipt bool) (*types.ExecutionRequest, *types.ExecutionRequest) {
+		return fixtureWithMode(t, bindReceipt, false)
 	}
 	fixture := func(t *testing.T) (*types.ExecutionRequest, *types.ExecutionRequest) {
 		return fixtureWithReceipt(t, true)
@@ -98,6 +119,75 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		require.NoError(t, err)
 		require.Equal(t, "closing", r.Phase)
 		require.Error(t, db.ReleaseJobExecution(ctx, req))
+	}
+	for _, mode := range []string{"settles atomically", "candidate missing", "candidate changed", "original candidate changed", "saved checkpoint changed", "proof unavailable", "checkpoint transaction rolled back"} {
+		t.Run("backfill recovery preserves authoritative checkpoint/"+mode, func(t *testing.T) {
+			old, newer := fixtureWithMode(t, true, true)
+			_, originalDir := utils.GetExecutionDirAndSubDir(old)
+			_, stableDir := utils.GetWorkflowDirAndSubDir(old.WorkflowID, types.Sync)
+			if mode == "candidate missing" {
+				require.NoError(t, os.Remove(stableDir+"/"+utils.BackfillRecoveryCheckpointFile))
+			} else if mode == "candidate changed" {
+				data, err := storage.ReadFile(ctx, stableDir, utils.BackfillRecoveryCheckpointFile, false)
+				require.NoError(t, err)
+				require.NoError(t, storage.WriteFileAtomic(ctx, stableDir, utils.BackfillRecoveryCheckpointFile, data+"\n"))
+			} else if mode == "original candidate changed" {
+				data, err := storage.ReadFile(ctx, originalDir, utils.BackfillRecoveryCheckpointFile, false)
+				require.NoError(t, err)
+				require.NoError(t, storage.WriteFileAtomic(ctx, originalDir, utils.BackfillRecoveryCheckpointFile, data+"\n"))
+			}
+			if mode == "candidate missing" || mode == "candidate changed" {
+				require.Error(t, db.AdoptExecution(ctx, old, newer))
+				r, err := db.GetExecution(ctx, 42, old.WorkflowID)
+				require.NoError(t, err)
+				require.Equal(t, old.RunID, r.OwnerRunID)
+				require.Equal(t, "closing", r.Phase)
+				require.Error(t, db.ReleaseJobExecution(ctx, old))
+				return
+			}
+			adopt(t, old, newer)
+			job, err := db.GetJobData(ctx, 42)
+			require.NoError(t, err)
+			require.Equal(t, `{}`, job.State)
+			if mode == "saved checkpoint changed" {
+				_, err = db.client.ExecContext(ctx, `UPDATE enrollment_job SET state=$1 WHERE id=42`, recoveryDBFinal)
+				require.NoError(t, err)
+			}
+			if mode == "checkpoint transaction rolled back" {
+				_, err = db.client.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION fail_backfill_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase='closed' THEN RAISE EXCEPTION 'injected after checkpoint update'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_backfill_completion BEFORE UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION fail_backfill_completion()`, db.executionTable()))
+				require.NoError(t, err)
+				defer func() {
+					_, err := db.client.ExecContext(ctx, fmt.Sprintf(`DROP TRIGGER fail_backfill_completion ON %s; DROP FUNCTION fail_backfill_completion()`, db.executionTable()))
+					require.NoError(t, err)
+				}()
+			}
+			err = db.CompleteOrdinaryRecovery(ctx, newer, func(context.Context) (string, error) {
+				if mode == "proof unavailable" {
+					return "", errors.New("common final table proof unavailable")
+				}
+				return recoveryDBFinal, nil
+			})
+			if mode == "settles atomically" || mode == "original candidate changed" {
+				require.NoError(t, err)
+				require.NoError(t, db.ReleaseJobExecution(ctx, newer))
+			} else {
+				require.Error(t, err)
+				require.Error(t, db.ReleaseJobExecution(ctx, newer))
+			}
+			job, err = db.GetJobData(ctx, 42)
+			require.NoError(t, err)
+			if mode == "settles atomically" || mode == "original candidate changed" || mode == "saved checkpoint changed" {
+				require.Equal(t, recoveryDBFinal, job.State)
+			} else {
+				require.Equal(t, `{}`, job.State)
+			}
+			if mode != "settles atomically" && mode != "original candidate changed" {
+				r, err := db.GetExecution(ctx, 42, newer.WorkflowID)
+				require.NoError(t, err)
+				require.Equal(t, "closing", r.Phase)
+				require.Equal(t, "recovery", r.Outcome)
+			}
+		})
 	}
 	t.Run("ordinary recovery concurrent adoption and one durable launcher", func(t *testing.T) {
 		old, newer := fixture(t)
