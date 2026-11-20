@@ -49,7 +49,11 @@ func (db *ordinaryRecoveryStore) CompleteOrdinaryRecovery(ctx context.Context, r
 
 func ordinaryRecoveryFixture(t *testing.T) (*AbstractExecutor, *ordinaryRecoveryStore, *types.ExecutionRequest, string) {
 	t.Helper()
-	req, dir := executorEnrollmentFixture(t)
+	req, _ := executorEnrollmentFixture(t)
+	req.RuntimeID += "-original-runtime"
+	req.LaunchID = req.RuntimeID
+	_, dir := utils.GetExecutionDirAndSubDir(req)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
 	req.ResourceID, req.ResourceUID = "original-resource", "original-uid"
 	job := types.JobData{Driver: "postgres", DestinationDriver: "iceberg", Source: `{"host":"original","replication_slot":"slot"}`, Destination: `{"type":"ICEBERG","writer":{"catalog_type":"rest"}}`, Streams: ordinaryCatalog, State: ordinaryBaseline}
 	store := &ordinaryRecoveryStore{job: job}

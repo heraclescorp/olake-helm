@@ -325,3 +325,173 @@ func TestEnrollmentSortPolicyEditsStayFenced(t *testing.T) {
 		}
 	}
 }
+
+const enrollmentCOWDefinition = `{"stream":{"name":"new","namespace":"public","supports_iceberg_copy_on_write":true,"source_defined_primary_key":["id"],"type_schema":{"properties":{"id":{"type":["integer"]},"value":{"type":["null","string"]},"_olake_id":{"type":["string"],"olake_column":true}}},"destination_database":"lake:public","destination_table":"new","sync_mode":"cdc"}}`
+const enrollmentCOWSelection = `{"stream_name":"new","normalization":true,"append_mode":false,"update_type":"pos","merge_strategy":"copy-on-write","selected_columns":{"columns":["_olake_id","id","value"],"sync_new_columns":false}}`
+
+func enrollmentCOWFixture(split bool) (JobData, EnrollmentResult) {
+	job, result := enrollmentFixture(split)
+	job.Source = `{"update_method":{"toast_value_source":"source"}}`
+	job.Destination = `{"type":"ICEBERG","writer":{"catalog_type":"rest"}}`
+	job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"update_type":"pos"`, `"update_type":"pos","merge_strategy":"copy-on-write"`, 1)
+	available, selection := &result.Streams, &result.Streams
+	if split {
+		available, selection = &result.AvailableStreams, &result.SelectedStreams
+	}
+	*available = strings.Replace(*available, enrollmentNewDefinition, enrollmentCOWDefinition, 1)
+	*selection = strings.Replace(*selection, enrollmentNewSelection, enrollmentCOWSelection, 1)
+	return job, result
+}
+
+func TestEnrollmentCOWPolicyValidation(t *testing.T) {
+	for _, strategy := range []string{`""`, `null`, `"bad"`, `1`} {
+		job, _ := enrollmentCOWFixture(true)
+		job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"merge_strategy":"copy-on-write"`, `"merge_strategy":`+strategy, 1)
+		_, err := job.AutoTableEnrollment()
+		require.Error(t, err, strategy)
+	}
+	for _, mutation := range []string{"unnormalized", "append", "invalid update type", "destination toast", "invalid toast", "invalid source"} {
+		t.Run(mutation, func(t *testing.T) {
+			job, _ := enrollmentCOWFixture(true)
+			switch mutation {
+			case "unnormalized":
+				job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"normalization":true`, `"normalization":false`, 1)
+			case "append":
+				job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"append_mode":false`, `"append_mode":true`, 1)
+			case "invalid update type":
+				job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"update_type":"pos"`, `"update_type":"bad"`, 1)
+			case "destination toast":
+				job.Source = `{"update_method":{"toast_value_source":"destination"}}`
+			case "invalid toast":
+				job.Source = `{"update_method":{"toast_value_source":"invalid"}}`
+			case "invalid source":
+				job.Source = `[]`
+			}
+			_, err := job.AutoTableEnrollment()
+			require.Error(t, err)
+		})
+	}
+	job, _ := enrollmentCOWFixture(true)
+	for _, source := range []string{`{}`, `{"update_method":{}}`, `{"update_method":{"toast_value_source":null}}`, `{"update_method":{"toast_value_source":"source"}}`} {
+		job.Source = source
+		policy, err := job.AutoTableEnrollment()
+		require.NoError(t, err)
+		require.Equal(t, "copy-on-write", policy.Defaults.MergeStrategy)
+	}
+}
+
+func TestEnrollmentCOWPreservesIndexAndExistingSettings(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		for _, update := range []string{"eq", "pos", "dv"} {
+			for _, existingIndex := range []bool{false, true} {
+				t.Run(map[bool]string{false: "legacy/", true: "split/"}[split]+update+map[bool]string{false: "/no-index", true: "/existing-index"}[existingIndex], func(t *testing.T) {
+					job, result := enrollmentCOWFixture(split)
+					job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"update_type":"pos"`, `"update_type":"`+update+`"`, 1)
+					if existingIndex {
+						job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"index_required":false`, `"index_required":true`, 1)
+					}
+					selection := &result.Streams
+					if split {
+						selection = &result.SelectedStreams
+					}
+					if existingIndex {
+						// A previously selected indexed MOR stream must retain its index
+						// and its exact metadata when an index-free COW stream is added.
+						oldSelection := &job.Streams
+						if split {
+							oldSelection = &job.SelectedStreams
+						}
+						mixed := strings.Replace(enrollmentOldSelection, `"append_mode":true`, `"append_mode":false`, 1)
+						mixed = strings.Replace(mixed, `"update_type":"eq"`, `"update_type":"pos"`, 1)
+						*oldSelection = strings.Replace(*oldSelection, enrollmentOldSelection, mixed, 1)
+						*selection = strings.Replace(*selection, enrollmentOldSelection, mixed, 1)
+					}
+					*selection = strings.Replace(*selection, enrollmentCOWSelection, strings.Replace(enrollmentCOWSelection, `"update_type":"pos"`, `"update_type":"`+update+`"`, 1), 1)
+					proposed, err := job.ValidateEnrollment(result)
+					require.NoError(t, err)
+					require.Equal(t, job.AdvancedSettings, proposed.AdvancedSettings)
+					require.Equal(t, job.State, proposed.State)
+					index, err := proposed.IndexRequired()
+					require.NoError(t, err)
+					require.Equal(t, existingIndex, index)
+				})
+			}
+		}
+	}
+}
+
+func TestEnrollmentRejectsForgedCOWProposals(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		for _, mutation := range []string{"missing strategy", "wrong strategy", "missing capability", "missing pk", "empty pk", "fake pk", "metadata pk", "nullable pk", "duplicate pk", "wrong mode", "mode override", "wrong table", "table override", "dedup override", "unselected column", "edit old", "missing new columns"} {
+			t.Run(map[bool]string{false: "legacy/", true: "split/"}[split]+mutation, func(t *testing.T) {
+				job, result := enrollmentCOWFixture(split)
+				available, selected := &result.Streams, &result.Streams
+				if split {
+					available, selected = &result.AvailableStreams, &result.SelectedStreams
+				}
+				switch mutation {
+				case "missing strategy":
+					*selected = strings.Replace(*selected, `,"merge_strategy":"copy-on-write"`, "", 1)
+				case "wrong strategy":
+					*selected = strings.Replace(*selected, `"merge_strategy":"copy-on-write"`, `"merge_strategy":"merge-on-read"`, 1)
+				case "missing capability":
+					*available = strings.Replace(*available, `"supports_iceberg_copy_on_write":true`, `"supports_iceberg_copy_on_write":false`, 1)
+				case "missing pk":
+					*available = strings.Replace(*available, `"source_defined_primary_key":["id"],`, "", 1)
+				case "empty pk":
+					*available = strings.Replace(*available, `"source_defined_primary_key":["id"]`, `"source_defined_primary_key":[]`, 1)
+				case "fake pk":
+					*available = strings.Replace(*available, `"source_defined_primary_key":["id"]`, `"source_defined_primary_key":["missing"]`, 1)
+				case "metadata pk":
+					*available = strings.Replace(*available, `"source_defined_primary_key":["id"]`, `"source_defined_primary_key":["_olake_id"]`, 1)
+				case "nullable pk":
+					*available = strings.Replace(*available, `"id":{"type":["integer"]}`, `"id":{"type":["integer","null"]}`, 1)
+				case "duplicate pk":
+					*available = strings.Replace(*available, `"source_defined_primary_key":["id"]`, `"source_defined_primary_key":["id","id"]`, 1)
+				case "wrong mode":
+					*available = strings.Replace(*available, `"sync_mode":"cdc"`, `"sync_mode":"full_refresh"`, 1)
+				case "mode override":
+					*selected = strings.Replace(*selected, enrollmentCOWSelection, strings.Replace(enrollmentCOWSelection, `"stream_name":"new"`, `"stream_name":"new","sync_mode":"full_refresh"`, 1), 1)
+				case "wrong table":
+					*available = strings.Replace(*available, `"destination_table":"new"`, `"destination_table":"other"`, 1)
+				case "table override":
+					*selected = strings.Replace(*selected, enrollmentCOWSelection, strings.Replace(enrollmentCOWSelection, `"stream_name":"new"`, `"stream_name":"new","destination_table":"other"`, 1), 1)
+				case "dedup override":
+					*selected = strings.Replace(*selected, enrollmentCOWSelection, strings.Replace(enrollmentCOWSelection, `"stream_name":"new"`, `"stream_name":"new","dedup_keys":["id"]`, 1), 1)
+				case "unselected column":
+					*selected = strings.Replace(*selected, `["_olake_id","id","value"]`, `["_olake_id","id"]`, 1)
+				case "edit old":
+					*available = strings.Replace(*available, `"destination_database":"keep"`, `"destination_database":"other"`, 1)
+				case "missing new columns":
+					*selected = strings.Replace(*selected, `"sync_new_columns":false`, `"sync_new_columns":true`, 1)
+				}
+				_, err := job.ValidateEnrollment(result)
+				require.Error(t, err)
+			})
+		}
+	}
+}
+
+func TestEnrollmentMORRejectsUnapprovedCOW(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		for _, explicit := range []bool{false, true} {
+			job, result := enrollmentFixture(split)
+			if explicit {
+				job.AdvancedSettings = strings.Replace(job.AdvancedSettings, `"update_type":"pos"`, `"update_type":"pos","merge_strategy":"merge-on-read"`, 1)
+			}
+			selection := &result.Streams
+			if split {
+				selection = &result.SelectedStreams
+			}
+			*selection = strings.Replace(*selection, enrollmentNewSelection, strings.Replace(enrollmentNewSelection, `"stream_name":"new"`, `"stream_name":"new","merge_strategy":"copy-on-write"`, 1), 1)
+			_, err := job.ValidateEnrollment(result)
+			require.Error(t, err)
+			*selection = strings.Replace(*selection, `"merge_strategy":"copy-on-write"`, `"merge_strategy":"merge-on-read"`, 1)
+			proposed, err := job.ValidateEnrollment(result)
+			require.NoError(t, err)
+			index, err := proposed.IndexRequired()
+			require.NoError(t, err)
+			require.True(t, index)
+		}
+	}
+}

@@ -21,6 +21,7 @@ const OrdinaryRecoveryBaselineFile = "ordinary-recovery-baseline.json"
 const OrdinaryRecoveryResultFile = "ordinary-recovery-result.json"
 
 const OrdinaryRecoveryServerFile = "ordinary-recovery-server.json"
+const BackfillRecoveryCheckpointFile = "backfill-recovery-checkpoint.json"
 
 type OrdinaryRecoveryServer struct {
 	Version          int    `json:"version"`
@@ -34,14 +35,17 @@ type OrdinaryRecoveryServer struct {
 // receive byte-identical copies; neither an activity retry nor an epoch reset
 // is allowed to move the trusted lower bound or replace a bound original receipt.
 type OrdinaryRecoveryOrigin struct {
-	Version               int    `json:"version"`
-	OriginalExecutionID   string `json:"original_execution_id"`
-	OriginalLaunchID      string `json:"original_launch_id"`
-	OriginalReceiptSHA256 string `json:"original_receipt_sha256"` // Empty when no original receipt was available.
-	SourceSHA256          string `json:"source_sha256"`
-	DestinationSHA256     string `json:"destination_sha256"`
-	CatalogSHA256         string `json:"catalog_sha256"`
-	BaselineStateSHA256   string `json:"baseline_state_sha256"`
+	Version                  int    `json:"version"`
+	OriginalExecutionID      string `json:"original_execution_id"`
+	OriginalLaunchID         string `json:"original_launch_id"`
+	OriginalReceiptSHA256    string `json:"original_receipt_sha256"` // Empty when no original receipt was available.
+	SourceSHA256             string `json:"source_sha256"`
+	DestinationSHA256        string `json:"destination_sha256"`
+	CatalogSHA256            string `json:"catalog_sha256"`
+	BaselineStateSHA256      string `json:"baseline_state_sha256"`
+	Backfill                 bool   `json:"backfill,omitempty"`
+	BackfillCheckpointSHA256 string `json:"backfill_checkpoint_sha256,omitempty"`
+	SavedStateSHA256         string `json:"saved_state_sha256,omitempty"`
 }
 
 type OrdinaryRecoveryTableProof struct {
@@ -62,6 +66,13 @@ type OrdinaryRecoveryResult struct {
 	ServerIdentity      string                       `json:"server_identity"`
 	SlotName            string                       `json:"slot_name"`
 	ToastValueSemantics string                       `json:"toast_value_semantics"`
+}
+
+func (origin OrdinaryRecoveryOrigin) SavedCheckpointSHA256() string {
+	if origin.Backfill {
+		return origin.SavedStateSHA256
+	}
+	return origin.BaselineStateSHA256
 }
 
 func RawSHA256(data string) string {
@@ -193,8 +204,24 @@ func ReadOrdinaryRecoveryOrigin(ctx context.Context, req *types.ExecutionRequest
 	if (origin.OriginalReceiptSHA256 != "" && (receipt == "" || origin.OriginalReceiptSHA256 != RawSHA256(receipt))) || origin.SourceSHA256 != RawSHA256(files["source.json"]) || origin.DestinationSHA256 != RawSHA256(files["destination.json"]) || origin.CatalogSHA256 != catalog || origin.BaselineStateSHA256 != stateSHA {
 		return origin, "", nil, fmt.Errorf("ordinary recovery origin evidence changed")
 	}
-	if _, _, err := OrdinaryRecoverySelection(files, baseline); err != nil {
-		return origin, "", nil, err
+	if origin.Backfill {
+		candidate, data, err := ReadBackfillRecoveryCheckpoint(ctx, req, files)
+		if err != nil {
+			return origin, "", nil, err
+		}
+		if origin.BackfillCheckpointSHA256 != RawSHA256(data) || candidate.StateSHA256 != stateSHA || !validRecoverySHA256(origin.SavedStateSHA256) {
+			return origin, "", nil, fmt.Errorf("immutable backfill recovery origin differs from original candidate or saved checkpoint binding")
+		}
+	} else {
+		if origin.BackfillCheckpointSHA256 != "" || origin.SavedStateSHA256 != "" {
+			return origin, "", nil, fmt.Errorf("ordinary CDC recovery origin contains backfill-only evidence")
+		}
+		if _, _, err := OrdinaryRecoverySelection(files, baseline); err != nil {
+			if _, _, candidateErr := ReadBackfillRecoveryCheckpoint(ctx, req, files); candidateErr != nil {
+				return origin, "", nil, fmt.Errorf("immutable ordinary recovery baseline cannot be replaced: %w", candidateErr)
+			}
+			return origin, "", nil, fmt.Errorf("immutable ordinary recovery origin selected an incomplete baseline and cannot be replaced by a backfill candidate; job remains paused and owned: %w", err)
+		}
 	}
 	return origin, baseline, files, nil
 }
@@ -257,9 +284,15 @@ func ParseRecoveryLSN(lsn string) (uint64, error) {
 	return hi<<32 | lo, nil
 }
 
-// Recovery never broadens selection or backfills. Every originally selected
-// stream needs a PK, CDC mode and saved completed GLOBAL membership.
 func OrdinaryRecoverySelection(files map[string]string, state string) (map[string]bool, string, error) {
+	return ordinaryRecoverySelection(files, state, false)
+}
+
+func OrdinaryBackfillRecoverySelection(files map[string]string, state string) (map[string]bool, string, error) {
+	return ordinaryRecoverySelection(files, state, true)
+}
+
+func ordinaryRecoverySelection(files map[string]string, state string, backfill bool) (map[string]bool, string, error) {
 	type definition struct {
 		Stream struct {
 			Name       string   `json:"name"`
@@ -363,11 +396,20 @@ func OrdinaryRecoverySelection(files map[string]string, state string) (map[strin
 	}
 	members := make(map[string]bool)
 	for _, stream := range checkpoint.Global.Streams {
+		if backfill && (!selected[stream] || members[stream]) {
+			return nil, "", fmt.Errorf("backfill candidate has duplicate or unselected completed membership")
+		}
 		members[stream] = true
 	}
-	for stream := range selected {
-		if !members[stream] {
-			return nil, "", fmt.Errorf("selected stream %s has no completed baseline membership", stream)
+	if backfill {
+		if err := validateBackfillRecoveryPlans(state, selected, members); err != nil {
+			return nil, "", err
+		}
+	} else {
+		for stream := range selected {
+			if !members[stream] {
+				return nil, "", fmt.Errorf("selected stream %s has no completed baseline membership", stream)
+			}
 		}
 	}
 	return selected, checkpoint.Global.State.LSN, nil
@@ -389,6 +431,28 @@ func ValidateOrdinaryRecoveryServer(data string, origin OrdinaryRecoveryOrigin) 
 func PreserveOrdinaryRecoveryServer(ctx context.Context, req *types.ExecutionRequest, origin OrdinaryRecoveryOrigin) error {
 	var server *OrdinaryRecoveryServer
 	_, stableDir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
+	if origin.Backfill {
+		files, err := ReadOrdinaryFrozenConfigs(ctx, req)
+		if err != nil {
+			return err
+		}
+		candidate, data, err := ReadBackfillRecoveryCheckpoint(ctx, req, files)
+		if err != nil {
+			return err
+		}
+		if RawSHA256(data) != origin.BackfillCheckpointSHA256 || candidate.StateSHA256 != origin.BaselineStateSHA256 {
+			return fmt.Errorf("backfill candidate differs from immutable recovery origin")
+		}
+		pin := OrdinaryRecoveryServer{Version: 1, OriginalLaunchID: origin.OriginalLaunchID, SourceSHA256: origin.SourceSHA256, ServerIdentity: candidate.ServerIdentity, SlotName: candidate.SlotName}
+		server = &pin
+		encoded, err := json.Marshal(pin)
+		if err != nil {
+			return err
+		}
+		if _, err := storage.CreateFileIfAbsent(ctx, stableDir, OrdinaryRecoveryServerFile, string(encoded)); err != nil {
+			return err
+		}
+	}
 	if req.RuntimeID != req.LaunchID {
 		_, runtimeDir := GetExecutionDirAndSubDir(req)
 		data, err := storage.ReadFile(ctx, runtimeDir, OrdinaryRecoveryServerFile, false)
@@ -396,6 +460,9 @@ func PreserveOrdinaryRecoveryServer(ctx context.Context, req *types.ExecutionReq
 			pin, err := ValidateOrdinaryRecoveryServer(data, origin)
 			if err != nil {
 				return err
+			}
+			if server != nil && *server != pin {
+				return fmt.Errorf("recovery PostgreSQL server pin differs from original backfill candidate")
 			}
 			server = &pin
 			if _, err := storage.CreateFileIfAbsent(ctx, stableDir, OrdinaryRecoveryServerFile, data); err != nil {
