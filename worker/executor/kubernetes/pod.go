@@ -92,17 +92,27 @@ func (k *KubernetesExecutor) waitForPodCompletion(ctx context.Context, podName, 
 			unschedulableSince = time.Time{}
 		}
 
-		// Check if pod completed successfully
-		if pod.Status.Phase == corev1.PodSucceeded {
+		// Sidecars can keep the pod Running after the connector exits. Only the
+		// named connector determines the operation's completion, not status order.
+		var connectorTermination *corev1.ContainerStateTerminated
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name == "connector" {
+				connectorTermination = status.State.Terminated
+				break
+			}
+		}
+
+		if (connectorTermination != nil && connectorTermination.ExitCode == 0) ||
+			(connectorTermination == nil && pod.Status.Phase == corev1.PodSucceeded) {
 			log.Info(fmt.Sprintf("Pod %s completed successfully", podName))
 			return nil
 		}
 
-		// Check if pod failed
-		if pod.Status.Phase == corev1.PodFailed {
-			// Check if this is a retryable infrastructure failure
+		// A failed connector is terminal even if another container is still live.
+		if connectorTermination != nil || pod.Status.Phase == corev1.PodFailed {
+			// Check if this is a retryable infrastructure failure before the connector exits.
 			retryableReasons := []string{"ImagePullBackOff", "ErrImagePull"}
-			if slices.Contains(retryableReasons, pod.Status.Reason) {
+			if connectorTermination == nil && slices.Contains(retryableReasons, pod.Status.Reason) {
 				log.Warn("pod not running, continuing to poll", "podName", podName, "reason", pod.Status.Reason, "message", pod.Status.Message)
 				continue
 			}
@@ -125,8 +135,8 @@ func (k *KubernetesExecutor) waitForPodCompletion(ctx context.Context, podName, 
 			// A pod-level reason (Evicted, DeadlineExceeded) explains the kill better than
 			// the container's own, which is usually just "Error" with exit 137.
 			// refer: https://pkg.go.dev/k8s.io/api/core/v1#ContainerState
-			if len(pod.Status.ContainerStatuses) > 0 && pod.Status.ContainerStatuses[0].State.Terminated != nil {
-				term := pod.Status.ContainerStatuses[0].State.Terminated
+			if connectorTermination != nil {
+				term := connectorTermination
 				exitCode := int(term.ExitCode)
 				podFailure.ExitCode = &exitCode
 				if podFailure.Reason == "" {

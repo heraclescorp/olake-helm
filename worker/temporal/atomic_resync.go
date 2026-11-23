@@ -59,6 +59,15 @@ func (a *Activity) acquireJobExecution(ctx context.Context, req *types.Execution
 	old := *req
 	old.RunID = r.OwnerRunID
 	executionRequestFromRecord(&old, r)
+	if req.Command == types.ClearDestination && r.Controlled {
+		if err := a.executor.RetireForClear(ctx, &old); err != nil {
+			return fmt.Errorf("prior execution cannot be safely retired for clear: %w", err)
+		}
+		if err := a.db.AdoptExecution(ctx, &old, req); err != nil {
+			return err
+		}
+		return a.db.AcquireJobExecution(ctx, req)
+	}
 	if req.Command != types.Resync && (r.LaunchID != "" || !r.Controlled) {
 		if err := a.executor.CleanupAndPersistState(ctx, &old); err != nil {
 			if req.Command != types.Sync || !r.Controlled {

@@ -26,7 +26,7 @@ type ordinaryRecoveryActivityDB struct {
 }
 
 func (db *ordinaryRecoveryActivityDB) AdoptExecution(ctx context.Context, old, newer *types.ExecutionRequest) error {
-	if !db.originAuthorized {
+	if newer.Command == types.ClearDestination || !db.originAuthorized {
 		return db.enrollmentActivityDB.AdoptExecution(ctx, old, newer)
 	}
 	r := db.records[old.WorkflowID]
@@ -44,11 +44,11 @@ func (db *ordinaryRecoveryActivityDB) AdoptExecution(ctx context.Context, old, n
 }
 
 func TestOrdinaryUnknownRecoveryAdoptsOnlyAfterTerminalEpochAndProofPreparation(t *testing.T) {
-	for _, mode := range []string{"supported recovery", "missing original receipt", "missing helper pin and receipt", "active old epoch", "active helper epoch", "retirement unproven", "helper retirement unproven", "unsupported clear", "recovery connector failed", "fresh recovery receipt missing"} {
+	for _, mode := range []string{"supported recovery", "missing original receipt", "missing helper pin and receipt", "active old epoch", "active helper epoch", "retirement unproven", "helper retirement unproven", "clear without terminal receipt", "recovery connector failed", "fresh recovery receipt missing"} {
 		t.Run(mode, func(t *testing.T) {
 			req, base := activityEnrollmentFixture(t)
 			req.Command, req.RunID = types.Sync, "recovery-run"
-			if mode == "unsupported clear" {
+			if mode == "clear without terminal receipt" {
 				req.Command = types.ClearDestination
 			}
 			db := &ordinaryRecoveryActivityDB{enrollmentActivityDB: base}
@@ -71,6 +71,10 @@ func TestOrdinaryUnknownRecoveryAdoptsOnlyAfterTerminalEpochAndProofPreparation(
 			}}
 			prepared, launches := 0, 0
 			a := &Activity{db: db, tempClient: tc, executor: &atomicActivityExecutor{
+				retireForClear: func(context.Context, *types.ExecutionRequest) error {
+					require.Equal(t, "clear without terminal receipt", mode)
+					return errors.New("clear requires a known terminal ordinary receipt")
+				},
 				ordinaryCleanup: func(_ context.Context, current *types.ExecutionRequest) error {
 					if current.RunID == "original-run" {
 						if mode == "missing original receipt" || strings.Contains(mode, "helper") {

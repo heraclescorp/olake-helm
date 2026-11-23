@@ -264,7 +264,7 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 				admittedTestRequest(t, ctx, db, old, "ordinary-runtime")
 				_, err := db.SealExecution(ctx, old)
 				require.NoError(t, err)
-				newer := executionTestRequest(old.WorkflowID, "retirement-run", command)
+				newer := executionTestRequest(old.WorkflowID, "retirement-run", types.Sync)
 				if outcome == "unknown" {
 					require.Error(t, db.AdoptExecution(ctx, old, newer))
 					require.Error(t, db.ReleaseJobExecution(ctx, old))

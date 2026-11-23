@@ -156,6 +156,57 @@ func (a *AbstractExecutor) RetireExecution(ctx context.Context, req *types.Execu
 	})
 }
 
+// RetireForClear retires a retained ordinary operation without replaying CDC.
+// The incoming command is the new clear intent; only the old runtime's bound
+// receipt may identify the command used for provider lookup and finalization.
+func (a *AbstractExecutor) RetireForClear(ctx context.Context, req *types.ExecutionRequest) error {
+	if req.Command != types.ClearDestination {
+		return fmt.Errorf("clear retirement requires explicit clear-destination intent")
+	}
+	r, err := a.db.SealExecution(ctx, req)
+	if err != nil {
+		return err
+	}
+	applyRecord(req, r)
+	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
+		if !current.Controlled || current.Phase == "handoff" || current.Phase == "handed_off" || current.HandoffToken != "" || current.HandoffRequestID != "" || current.HandoffRunID != "" || current.HandoffActive {
+			return fmt.Errorf("clear retirement requires a controlled ordinary operation without resync handoff")
+		}
+		if current.Phase == "closed" && current.Outcome == "not_launched" && current.RuntimeID == "" && current.LaunchID == "" && current.ResourceID == "" && current.ResourceUID == "" && current.LauncherAttemptID == "" {
+			return nil
+		}
+		proof, err := readExecutionResult(ctx, req)
+		if err != nil {
+			return err
+		}
+		req.Command = types.Command(proof.Command)
+		if (current.Outcome == "recovery" || current.RuntimeID != current.LaunchID) && req.Command != types.Sync {
+			return fmt.Errorf("ordinary recovery retirement requires sync proof")
+		}
+		if current.Phase != "closed" {
+			// CleanupAndPersistState rechecks settlement after positively stopping
+			// the exact provider resource, including separate recovery proof.
+			return nil
+		}
+		if current.Outcome != "settled" && current.Outcome != "not_started" && current.Outcome != "retired" {
+			return fmt.Errorf("closed execution has no positive ordinary retirement outcome")
+		}
+		if err := utils.RequireClosedExecutionFence(ctx, req); err != nil {
+			return err
+		}
+		if current.RuntimeID != current.LaunchID {
+			_, err = confirmedOrdinaryRecovery(ctx, req)
+			return err
+		}
+		_, _, err = confirmedExecutionResult(ctx, req)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return a.CleanupAndPersistState(ctx, req)
+}
+
 func (a *AbstractExecutor) prepareRetirement(ctx context.Context, req *types.ExecutionRequest) (*database.ExecutionRecord, error) {
 	r, err := a.db.SealExecution(ctx, req)
 	if err != nil {

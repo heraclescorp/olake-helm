@@ -292,7 +292,8 @@ func (db *DB) FinishExecution(ctx context.Context, req *types.ExecutionRequest, 
 }
 
 // Caller has positively retired the old runtime while holding GuardExecution.
-// A fresh data launch is never admitted after adoption: only bound recovery.
+// Ordinary sync adoption remains recovery-only or a closed retirement tombstone.
+// An explicit clear alone may start a fresh epoch after proven ordinary closure.
 func (db *DB) AdoptExecution(ctx context.Context, oldReq, newReq *types.ExecutionRequest) error {
 	if oldReq.RunID == "" || newReq.RunID == "" || oldReq.RunID == newReq.RunID || oldReq.WorkflowID != newReq.WorkflowID || oldReq.JobID != newReq.JobID {
 		return fmt.Errorf("epoch adoption requires distinct nonempty runs of the same operation")
@@ -308,45 +309,77 @@ func (db *DB) AdoptExecution(ctx context.Context, oldReq, newReq *types.Executio
 		if r.OwnerRunID != oldReq.RunID || (r.Phase != "closing" && r.Phase != "closed" && r.Phase != "handoff") {
 			return ErrExecutionClosed
 		}
-		ordinaryRecovery := newReq.Command == types.Sync && r.Controlled && r.LaunchID != "" && r.Phase == "closing"
-		if ordinaryRecovery {
-			if oldReq.RuntimeID != r.RuntimeID || oldReq.LaunchID != r.LaunchID || oldReq.ResourceID == "" || oldReq.ResourceID != r.ResourceID || oldReq.ResourceUID != r.ResourceUID {
-				return fmt.Errorf("ordinary recovery adoption requires the exact retired runtime identity")
+		if newReq.Command == types.ClearDestination && (r.Controlled || r.LaunchID != "") {
+			if !r.Controlled || r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "not_launched" && r.Outcome != "retired") || r.HandoffToken != "" || r.HandoffRequestID != "" || r.HandoffRunID != "" || r.HandoffActive {
+				return fmt.Errorf("fresh clear requires positive controlled retirement without resync handoff")
 			}
-			if err := utils.RequireClosedExecutionFence(ctx, oldReq); err != nil {
-				return err
+			if oldReq.RuntimeID != r.RuntimeID || oldReq.LaunchID != r.LaunchID || oldReq.LauncherAttemptID != r.LauncherAttemptID || oldReq.ResourceID != r.ResourceID || oldReq.ResourceUID != r.ResourceUID {
+				return fmt.Errorf("fresh clear adoption requires the exact retired runtime identity")
 			}
-			if err := db.ordinaryRecoveryBinding(ctx, tx, oldReq); err != nil {
-				return fmt.Errorf("ordinary recovery origin is not bound to saved job: %w", err)
+			if r.LaunchID == "" {
+				if r.Outcome != "not_launched" || r.RuntimeID != "" || r.LauncherAttemptID != "" || r.ResourceID != "" || r.ResourceUID != "" {
+					return fmt.Errorf("fresh clear requires a positively unlaunched or fenced retired runtime")
+				}
+			} else {
+				if r.RuntimeID == "" || r.Outcome == "not_launched" || (oldReq.Command != types.Sync && oldReq.Command != types.ClearDestination) {
+					return fmt.Errorf("fresh clear requires a retired ordinary runtime")
+				}
+				if err := utils.RequireClosedExecutionFence(ctx, oldReq); err != nil {
+					return err
+				}
 			}
-		}
-		retiredWithoutPublication := r.Phase == "closed" && (r.Outcome == "not_launched" || r.Outcome == "retired" || (newReq.Command == types.Resync && r.Outcome == "not_published"))
-		if retiredWithoutPublication || (r.LaunchID != "" && newReq.Command != types.Resync && !ordinaryRecovery) {
-			if !retiredWithoutPublication && (r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "retired")) {
-				return fmt.Errorf("ordinary execution cannot retire without positive settled outcome proof")
-			}
-			_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,outcome='retired',updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID)
-		} else if r.Phase == "handoff" {
-			sha, catalogSHA, active, bindingErr := db.handoffBinding(ctx, tx, oldReq.JobID)
-			if bindingErr != nil {
-				return bindingErr
-			}
-			if sha != r.StateSHA256 || catalogSHA != r.CatalogSHA256 || active != r.HandoffActive || r.HandoffToken == "" || r.HandoffRunID == "" || r.HandoffRequestID == "" {
-				return fmt.Errorf("cannot adopt a handoff whose transfer binding changed")
-			}
-			_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID)
+			_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,launch_id='',runtime_id='',launcher_attempt_id='',resource_id='',resource_uid='',phase='unadmitted',outcome='',updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID)
 		} else {
-			outcome := ""
-			if r.LaunchID != "" {
-				outcome = "recovery"
+			ordinaryRecovery := newReq.Command == types.Sync && r.Controlled && r.LaunchID != "" && r.Phase == "closing"
+			if ordinaryRecovery {
+				if oldReq.RuntimeID != r.RuntimeID || oldReq.LaunchID != r.LaunchID || oldReq.ResourceID == "" || oldReq.ResourceID != r.ResourceID || oldReq.ResourceUID != r.ResourceUID {
+					return fmt.Errorf("ordinary recovery adoption requires the exact retired runtime identity")
+				}
+				if err := utils.RequireClosedExecutionFence(ctx, oldReq); err != nil {
+					return err
+				}
+				if err := db.ordinaryRecoveryBinding(ctx, tx, oldReq); err != nil {
+					return fmt.Errorf("ordinary recovery origin is not bound to saved job: %w", err)
+				}
 			}
-			_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,runtime_id='',launcher_attempt_id='',resource_id='',resource_uid='',phase='unadmitted',outcome=$4,updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID, outcome)
+			retiredWithoutPublication := r.Phase == "closed" && (r.Outcome == "not_launched" || r.Outcome == "retired" || (newReq.Command == types.Resync && r.Outcome == "not_published"))
+			if retiredWithoutPublication || (r.LaunchID != "" && newReq.Command != types.Resync && !ordinaryRecovery) {
+				if !retiredWithoutPublication && (r.Phase != "closed" || (r.Outcome != "settled" && r.Outcome != "not_started" && r.Outcome != "retired")) {
+					return fmt.Errorf("ordinary execution cannot retire without positive settled outcome proof")
+				}
+				_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,outcome='retired',updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID)
+			} else if r.Phase == "handoff" {
+				sha, catalogSHA, active, bindingErr := db.handoffBinding(ctx, tx, oldReq.JobID)
+				if bindingErr != nil {
+					return bindingErr
+				}
+				if sha != r.StateSHA256 || catalogSHA != r.CatalogSHA256 || active != r.HandoffActive || r.HandoffToken == "" || r.HandoffRunID == "" || r.HandoffRequestID == "" {
+					return fmt.Errorf("cannot adopt a handoff whose transfer binding changed")
+				}
+				_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID)
+			} else {
+				outcome := ""
+				if r.LaunchID != "" {
+					outcome = "recovery"
+				}
+				_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET owner_run_id=$3,runtime_id='',launcher_attempt_id='',resource_id='',resource_uid='',phase='unadmitted',outcome=$4,updated_at=now() WHERE job_id=$1 AND workflow_id=$2`, db.executionTable()), oldReq.JobID, oldReq.WorkflowID, newReq.RunID, outcome)
+			}
 		}
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET execution_run_id=$3 WHERE id=$1 AND execution_workflow_id=$2 AND execution_run_id=$4`, pq.QuoteIdentifier(db.tables["job"])), oldReq.JobID, oldReq.WorkflowID, newReq.RunID, oldReq.RunID)
-		return err
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET execution_run_id=$3 WHERE id=$1 AND execution_workflow_id=$2 AND execution_run_id=$4`, pq.QuoteIdentifier(db.tables["job"])), oldReq.JobID, oldReq.WorkflowID, newReq.RunID, oldReq.RunID)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrJobExecutionOwned
+		}
+		return nil
 	})
 }
 

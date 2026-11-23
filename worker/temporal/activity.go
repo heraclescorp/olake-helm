@@ -25,6 +25,7 @@ type activityExecutor interface {
 	CleanupAndPersistState(context.Context, *types.ExecutionRequest) error
 	CleanupResync(context.Context, *types.ExecutionRequest, bool) error
 	RetireExecution(context.Context, *types.ExecutionRequest) error
+	RetireForClear(context.Context, *types.ExecutionRequest) error
 	PrepareOrdinaryRecovery(context.Context, *types.ExecutionRequest) error
 }
 
