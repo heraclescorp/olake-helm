@@ -99,20 +99,19 @@ global:
   #         limits:
   #           memory: "8Gi"
   # runtimeMemory (optional): select exactly one of goLimit (Kubernetes memory quantity)
-  # or goPercent (integer), plus required integer javaPercent. Resolved budgets must
-  # total at most 80% of the effective connector container memory LIMIT, not request.
+  # or goPercent (integer 1..80). The Go budget must be at most 80% of the effective
+  # connector container memory LIMIT, not request, leaving at least 20% for overhead.
   # Requires a finite positive limit; invalid selected policies fail before pod creation.
   # Async jobs use their own policy, then profile "0"; discover/test/spec use only "0".
-  # Explicit GOMEMLIMIT and OLAKE_JAVA_HEAP_PERCENT override global.env for that pod.
+  # Explicit GOMEMLIMIT overrides global.env for that pod.
   # No policy leaves inherited runtime budget variables unchanged. Do not set budgets globally.
   # Example added to job 123 above:
   #       runtimeMemory:
-  #         goPercent: 20
-  #         javaPercent: 50
+  #         goPercent: 80
   # Policies use effective resources after resource fallback; request/limit fields are not merged.
   # Invalid whole OLAKE_JOB_PROFILES JSON blocks launches until corrected; invalid individual
   # policies block only operations selecting that policy, never falling back to an unbudgeted pod.
-  # Budgets leave 20% headroom but are not hard process RSS limits.
+  # Go budgets leave at least 20% for overhead but are not hard process RSS limits.
   # Every connector receives OLAKE_JOB_ID and OLAKE_OPERATION_TYPE; workflow metadata is retained.
   # POD_NAME and POD_NAMESPACE use the downward API; exporter settings remain in global.env.
   jobProfiles: {}
