@@ -52,14 +52,7 @@ func validatePodAttachment(pod *corev1.Pod) error {
 	if pod.DeletionTimestamp != nil {
 		return fmt.Errorf("execution outcome unknown: admitted Kubernetes resource is terminating")
 	}
-	// A pending pod with no evidence that the connector started is not proof of
-	// an execution. Only the original Create caller may wait for its first start.
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name == "connector" && (status.State.Running != nil || status.State.Terminated != nil) {
-			return nil
-		}
-	}
-	return fmt.Errorf("execution outcome unknown: admitted Kubernetes resource has not completed a confirmed start")
+	return nil
 }
 
 func (k *KubernetesExecutor) findControlledPod(ctx context.Context, req *types.ExecutionRequest) (*corev1.Pod, error) {
