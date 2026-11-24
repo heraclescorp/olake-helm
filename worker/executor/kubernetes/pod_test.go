@@ -3,6 +3,7 @@ package kubernetes
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -57,10 +58,18 @@ func TestWaitForPodCompletionConnectorTermination(t *testing.T) {
 			phase      corev1.PodPhase
 			podReason  string
 			podMessage string
+			wantTip    string
 		}{
 			{name: "success with live sidecar", phase: corev1.PodRunning},
-			{name: "failure with live sidecar", exitCode: 137, phase: corev1.PodRunning},
-			{name: "eviction takes precedence", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "node ran out of memory"},
+			{name: "failure with live sidecar", exitCode: 137, phase: corev1.PodRunning, wantTip: "memory"},
+			{name: "memory eviction takes precedence", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "The node was low on resource: memory.", wantTip: "memory"},
+			{name: "memory pressure eviction", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "The node had condition: [MemoryPressure].", wantTip: "memory"},
+			{name: "ephemeral storage eviction overrides OOM termination", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "The node was low on resource: ephemeral-storage. Container connector was using more than its request.", wantTip: "storage"},
+			{name: "local storage limit eviction", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "Pod ephemeral local storage usage exceeds the total limit of containers.", wantTip: "storage"},
+			{name: "disk pressure overrides memory mention", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "The node had condition: [DiskPressure]. Memory usage was below its limit.", wantTip: "storage"},
+			{name: "filesystem pressure eviction", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "The node was low on resource: nodefs.available.", wantTip: "storage"},
+			{name: "unknown eviction overrides OOM termination", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", podMessage: "  Pod was evicted in response to imminent node shutdown.\n", wantTip: "neutral"},
+			{name: "eviction without detail is neutral", exitCode: 137, phase: corev1.PodFailed, podReason: "Evicted", wantTip: "neutral"},
 		} {
 			t.Run(order+"/"+tt.name, func(t *testing.T) {
 				connector := corev1.ContainerStatus{
@@ -119,6 +128,32 @@ func TestWaitForPodCompletionConnectorTermination(t *testing.T) {
 				}
 				if executionFailure.Reason != wantReason || executionFailure.Message != wantMessage {
 					t.Errorf("failure reason/message = %q/%q, want %q/%q", executionFailure.Reason, executionFailure.Message, wantReason, wantMessage)
+				}
+				message := failure.Describe(executionFailure)
+				tip := strings.ToLower(message.Tip)
+				switch tt.wantTip {
+				case "memory":
+					if !strings.Contains(tip, "memory") || strings.Contains(tip, "ephemeral-storage") {
+						t.Errorf("memory failure recommendation = %q", message.Tip)
+					}
+				case "storage":
+					if !strings.Contains(tip, "ephemeral-storage") || !strings.Contains(tip, "request") || !strings.Contains(tip, "disk capacity") || strings.Contains(tip, "memory") {
+						t.Errorf("disk eviction recommendation = %q", message.Tip)
+					}
+				case "neutral":
+					if tip == "" || strings.Contains(tip, "memory") || strings.Contains(tip, "ephemeral-storage") {
+						t.Errorf("unknown eviction recommendation is not resource-neutral: %q", message.Tip)
+					}
+				}
+				if tt.podReason == "Evicted" {
+					if failure.TelemetryReason(executionFailure) != "evicted" || !strings.Contains(message.Headline, "evicted") {
+						t.Errorf("eviction was reclassified using the container's OOM/137 status: %+v", message)
+					}
+					if !strings.Contains(message.Details, fmt.Sprintf("%q", tt.podMessage)) || !strings.Contains(err.Error(), tt.podMessage) {
+						t.Errorf("eviction detail was lost: %+v; error: %v", message, err)
+					}
+				} else if failure.TelemetryReason(executionFailure) != "oom_killed" {
+					t.Errorf("OOM termination telemetry = %q", failure.TelemetryReason(executionFailure))
 				}
 			})
 		}

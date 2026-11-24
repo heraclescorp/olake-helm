@@ -75,13 +75,16 @@ global:
   #                   operator: "In"
   #                   values: ["true"]
   #
-  # Resources (optional): CPU/memory for the connector pod, in the standard Kubernetes shape.
+  # Resources (optional): CPU, memory, and ephemeral-storage in the standard Kubernetes shape.
   # Only applied when set; otherwise pods keep the built-in default
   # (requests: memory=256Mi, cpu=100m; no limits).
   #   - Sync / clear-destination use the JobID's profile, then profile "0", then the built-in default.
   #   - Test / discover / spec always use profile "0", then the built-in default.
   #   - A profile's resources replace the fallback as a whole; fields are not merged.
   #   - Setting only a limit makes Kubernetes use the same value as the request.
+  #   - Ephemeral-storage requests/limits must be positive; requests cannot exceed their limits.
+  #     Invalid resources fall back without runtimeMemory; a selected memory policy fails closed.
+  #   - Ephemeral-storage sizes pod-local writable layers, logs, and disk-backed emptyDir, not index PVCs.
   # Example:
   #   jobProfiles:
   #     0:
@@ -96,8 +99,10 @@ global:
   #         requests:
   #           cpu: "2"
   #           memory: "8Gi"
+  #           ephemeral-storage: "12Gi"
   #         limits:
   #           memory: "8Gi"
+  #           ephemeral-storage: "24Gi"
   # runtimeMemory (optional): select exactly one of goLimit (Kubernetes memory quantity)
   # or goPercent (integer 1..80). The Go budget must be at most 80% of the effective
   # connector container memory LIMIT, not request, leaving at least 20% for overhead.

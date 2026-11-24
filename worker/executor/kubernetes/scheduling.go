@@ -32,8 +32,8 @@ type JobSchedulingConfig struct {
 	runtimeMemoryErr error
 }
 
-// validateResources rejects negative quantities and a request that exceeds its limit;
-// the API server would otherwise refuse every pod built from the profile.
+// validateResources requires positive ephemeral-storage quantities and rejects
+// negative quantities or requests above limits before creating pods.
 // Runs on every load, so it also covers a ConfigMap edited directly, where the Helm schema does not run.
 func validateResources(r *corev1.ResourceRequirements) error {
 	if r == nil {
@@ -43,6 +43,9 @@ func validateResources(r *corev1.ResourceRequirements) error {
 		for name, quantity := range list {
 			if quantity.Sign() < 0 {
 				return fmt.Errorf("%s %s %s is negative", name, kind, quantity.String())
+			}
+			if name == corev1.ResourceEphemeralStorage && quantity.IsZero() {
+				return fmt.Errorf("%s %s must be positive", name, kind)
 			}
 		}
 	}

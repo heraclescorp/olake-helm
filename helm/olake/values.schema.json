@@ -138,13 +138,14 @@
       "type": "object",
       "properties": {
         "cpu": { "$ref": "#/definitions/resourceQuantity" },
-        "memory": { "$ref": "#/definitions/resourceQuantity" }
+        "memory": { "$ref": "#/definitions/resourceQuantity" },
+        "ephemeral-storage": { "$ref": "#/definitions/resourceQuantity" }
       },
       "additionalProperties": false
     },
     "resourceRequirements": {
       "type": "object",
-      "description": "CPU/memory requests and limits for job pods using this profile. Replaces the fallback profile's resources as a whole.",
+      "description": "CPU, memory, and ephemeral-storage requests and limits for job pods using this profile. Replaces the fallback profile's resources as a whole. Ephemeral-storage quantities must be positive, and requests must not exceed their limits (validated by the worker).",
       "properties": {
         "requests": { "$ref": "#/definitions/resourceList" },
         "limits": { "$ref": "#/definitions/resourceList" }
