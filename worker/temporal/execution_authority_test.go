@@ -65,7 +65,10 @@ func (db *activityTestAuthority) AdmitExecution(_ context.Context, req *types.Ex
 	}
 	// Fixture identities are deterministic so old artifact-focused tests can name
 	// their directory, without relying on Temporal's random attempt generation.
-	r.Phase = "admitted"
+	r.Phase = "preparing"
+	if !r.Controlled {
+		r.Phase = "admitted"
+	}
 	r.LauncherAttemptID = attempt
 	if r.Controlled {
 		r.RuntimeID = req.WorkflowID
@@ -89,11 +92,22 @@ func (db *activityTestAuthority) GuardExecution(ctx context.Context, req *types.
 }
 func (db *activityTestAuthority) CheckLaunch(ctx context.Context, req *types.ExecutionRequest) error {
 	return db.GuardExecution(ctx, req, func(ctx context.Context, r *database.ExecutionRecord) error {
-		if r.Phase != "admitted" || !req.AllowLaunch || r.LauncherAttemptID != req.LauncherAttemptID {
+		if (r.Phase != "preparing" && r.Phase != "admitted") || !req.AllowLaunch || r.LauncherAttemptID != req.LauncherAttemptID {
 			return database.ErrExecutionClosed
 		}
 		return utils.ReadExecutionFence(ctx, req)
 	})
+}
+func (db *activityTestAuthority) BeginExecutionLaunch(ctx context.Context, req *types.ExecutionRequest) error {
+	if err := db.CheckLaunch(ctx, req); err != nil {
+		return err
+	}
+	r := db.records[req.WorkflowID]
+	if r.Phase != "preparing" {
+		return database.ErrExecutionClosed
+	}
+	r.Phase = "admitted"
+	return nil
 }
 func (db *activityTestAuthority) RecordExecutionResource(_ context.Context, req *types.ExecutionRequest, id, uid string) error {
 	r := db.records[req.WorkflowID]

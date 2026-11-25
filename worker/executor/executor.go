@@ -148,7 +148,7 @@ func (a *AbstractExecutor) RetireExecution(ctx context.Context, req *types.Execu
 	if err != nil {
 		return err
 	}
-	if r.Phase == "closed" || r.Phase == "handoff" || r.Phase == "handed_off" {
+	if r.Phase == "closed" || r.Phase == "handoff" || r.Phase == "handed_off" || r.Phase == "unlaunched" || r.Phase == "reserved" {
 		return nil
 	}
 	return a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
@@ -174,6 +174,18 @@ func (a *AbstractExecutor) RetireForClear(ctx context.Context, req *types.Execut
 		return err
 	}
 	applyRecord(req, r)
+	if r.Phase == "unlaunched" {
+		if r.Outcome == "recovery" || r.RuntimeID != r.LaunchID {
+			return fmt.Errorf("unlaunched recovery retains the original unknown execution; clear remains blocked")
+		}
+		if _, err := a.prepareRetirement(ctx, req); err != nil {
+			return err
+		}
+		return nil
+	}
+	if r.Controlled && r.Phase == "closed" && r.Outcome == "not_dispatched" && r.ResourceID == "" && r.ResourceUID == "" && r.RuntimeID == r.LaunchID {
+		return utils.RequireClosedExecutionFence(ctx, req)
+	}
 	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
 		if !current.Controlled || current.Phase == "handoff" || current.Phase == "handed_off" || current.HandoffToken != "" || current.HandoffRequestID != "" || current.HandoffRunID != "" || current.HandoffActive {
 			return fmt.Errorf("clear retirement requires a controlled ordinary operation without resync handoff")
@@ -225,14 +237,35 @@ func (a *AbstractExecutor) prepareRetirement(ctx context.Context, req *types.Exe
 	if !r.Controlled {
 		return r, nil
 	}
+	if r.Phase == "reserved" {
+		if err := a.reserveOrdinaryRecovery(ctx, req); err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
 	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
 		if err := utils.CloseExecutionFence(ctx, req); err != nil {
 			return err
+		}
+		if current.Phase == "unlaunched" {
+			if current.ResourceID != "" || current.ResourceUID != "" {
+				return fmt.Errorf("undispatched preparation has a conflicting provider identity")
+			}
+			return utils.RequireClosedExecutionFence(ctx, req)
 		}
 		return a.executor.ResolveResource(ctx, req)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if r.Phase == "unlaunched" {
+		if r.Outcome != "recovery" && r.RuntimeID == r.LaunchID {
+			if err := a.db.FinishExecution(ctx, req, "not_dispatched"); err != nil {
+				return nil, err
+			}
+			r.Phase, r.Outcome = "closed", "not_dispatched"
+		}
+		return r, nil
 	}
 	// Persist discovered immutable identity before deletion, so lost deletion or
 	// final SQL acknowledgements never require a name-only cleanup retry.
@@ -262,6 +295,9 @@ func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *type
 	}
 	if r.Phase == "closed" {
 		return nil
+	}
+	if r.Phase == "unlaunched" || r.Phase == "reserved" {
+		return fmt.Errorf("recovery preparation never dispatched; original execution still requires proof-backed recovery")
 	}
 	outcome := ""
 	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {

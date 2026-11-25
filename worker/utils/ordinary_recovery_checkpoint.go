@@ -269,11 +269,7 @@ func (authority ordinaryCheckpointAuthority) validateStateMembership(data string
 	return nil
 }
 
-func readOrdinaryCheckpointArtifacts(ctx context.Context, dir string, authority ordinaryCheckpointAuthority) ([]ordinaryCheckpointArtifact, error) {
-	names, err := storage.ListFiles(ctx, dir, OrdinaryRecoveryCheckpointsDir)
-	if err != nil {
-		return nil, err
-	}
+func readOrdinaryCheckpointArtifacts(ctx context.Context, dir string, authority ordinaryCheckpointAuthority, names []string) ([]ordinaryCheckpointArtifact, error) {
 	var artifacts []ordinaryCheckpointArtifact
 	for _, name := range names {
 		if strings.HasPrefix(name, ".") && strings.Contains(name, ".tmp-") {
@@ -355,12 +351,16 @@ func orderOrdinaryCheckpoints(artifacts []ordinaryCheckpointArtifact) ([]ordinar
 }
 
 func OrdinaryRecoveryCheckpointConfig(ctx context.Context, req *types.ExecutionRequest, origin OrdinaryRecoveryOrigin, baseline string, files map[string]string) (*types.JobConfig, error) {
+	_, stableDir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
+	names, err := storage.ListFiles(ctx, stableDir, OrdinaryRecoveryCheckpointsDir)
+	if err != nil || len(names) == 0 {
+		return nil, err
+	}
 	authority, err := newOrdinaryCheckpointAuthority(ctx, req, origin, baseline, files)
 	if err != nil {
 		return nil, err
 	}
-	_, stableDir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
-	artifacts, err := readOrdinaryCheckpointArtifacts(ctx, stableDir, authority)
+	artifacts, err := readOrdinaryCheckpointArtifacts(ctx, stableDir, authority, names)
 	if err != nil {
 		return nil, err
 	}
@@ -375,20 +375,38 @@ func PreserveOrdinaryRecoveryCheckpoints(ctx context.Context, req *types.Executi
 	if err := RequireClosedExecutionFence(ctx, req); err != nil {
 		return nil, fmt.Errorf("ordinary recovery checkpoint custody requires positively retired runtime: %w", err)
 	}
+	_, stableDir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
+	_, runtimeDir := GetExecutionDirAndSubDir(req)
+	input, inputErr := storage.ReadFile(ctx, runtimeDir, OrdinaryRecoveryCheckpointFile, false)
+	stableNames, err := storage.ListFiles(ctx, stableDir, OrdinaryRecoveryCheckpointsDir)
+	if err != nil {
+		return nil, err
+	}
+	runtimeNames, err := storage.ListFiles(ctx, runtimeDir, OrdinaryRecoveryCheckpointsDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(stableNames) == 0 && len(runtimeNames) == 0 {
+		if inputErr == nil {
+			return nil, fmt.Errorf("ordinary recovery runtime has an unpreserved checkpoint input")
+		}
+		if !errors.Is(inputErr, fs.ErrNotExist) {
+			return nil, inputErr
+		}
+		return nil, nil
+	}
 	authority, err := newOrdinaryCheckpointAuthority(ctx, req, origin, baseline, files)
 	if err != nil {
 		return nil, err
 	}
-	_, stableDir := GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
-	_, runtimeDir := GetExecutionDirAndSubDir(req)
-	stable, err := readOrdinaryCheckpointArtifacts(ctx, stableDir, authority)
+	stable, err := readOrdinaryCheckpointArtifacts(ctx, stableDir, authority, stableNames)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := orderOrdinaryCheckpoints(stable); err != nil {
 		return nil, err
 	}
-	runtime, err := readOrdinaryCheckpointArtifacts(ctx, runtimeDir, authority)
+	runtime, err := readOrdinaryCheckpointArtifacts(ctx, runtimeDir, authority, runtimeNames)
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +443,6 @@ func PreserveOrdinaryRecoveryCheckpoints(ctx context.Context, req *types.Executi
 			inherited = &ordered[i]
 		}
 	}
-	input, inputErr := storage.ReadFile(ctx, runtimeDir, OrdinaryRecoveryCheckpointFile, false)
 	if inherited == nil {
 		if inputErr == nil {
 			return nil, fmt.Errorf("ordinary recovery runtime has an unpreserved checkpoint input")

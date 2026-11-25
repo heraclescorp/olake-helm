@@ -26,6 +26,7 @@ func controlledPodRequest(command types.Command) *types.ExecutionRequest {
 		WorkflowID: "stable-operation", RunID: "owner-run", LaunchID: "data-launch", RuntimeID: "runtime-a", JobID: 42,
 		Command: command, ConnectorType: "postgres", Version: "v1", AllowLaunch: true, Controlled: true, Timeout: time.Minute,
 		BeforeLaunch:   func(context.Context) error { return nil },
+		BeginLaunch:    func(context.Context) error { return nil },
 		RecordResource: func(context.Context, string, string) error { return nil },
 	}
 }
@@ -46,7 +47,7 @@ func TestControlledKubernetesRecordsUIDImmediatelyAfterCreate(t *testing.T) {
 	req := controlledPodRequest(types.Resync)
 	spec := controlledPod(t, k, req)
 	var events []string
-	req.BeforeLaunch = func(context.Context) error { events = append(events, "authorize"); return nil }
+	req.BeginLaunch = func(context.Context) error { events = append(events, "authorize"); return nil }
 	client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		events = append(events, "create")
 		action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).UID = "created-uid"
@@ -73,7 +74,7 @@ func TestControlledKubernetesCannotCreateAfterAdmissionCloses(t *testing.T) {
 	k := newIndicatorExecutor(client)
 	req := controlledPodRequest(types.ClearDestination)
 	closed := errors.New("admission closed")
-	req.BeforeLaunch = func(context.Context) error { return closed }
+	req.BeginLaunch = func(context.Context) error { return closed }
 	if _, err := k.createControlledPod(context.Background(), req, controlledPod(t, k, req)); !errors.Is(err, closed) {
 		t.Fatalf("closed create error = %v", err)
 	}

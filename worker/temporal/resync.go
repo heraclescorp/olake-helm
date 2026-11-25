@@ -28,6 +28,7 @@ func (a *Activity) TriggerSyncAfterResyncActivity(ctx context.Context, req *type
 		restored.AllowLaunch = false
 		restored.RecoverOnly = false
 		restored.BeforeLaunch = nil
+		restored.BeginLaunch = nil
 		restored.RecordResource = nil
 		restored.AfterResyncOperationID = req.WorkflowID
 		restored.AfterResyncRunID = r.HandoffRunID

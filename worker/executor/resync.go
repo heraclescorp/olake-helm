@@ -54,6 +54,9 @@ func (a *AbstractExecutor) CleanupResync(ctx context.Context, req *types.Executi
 		}
 		return nil
 	}
+	if r.Phase == "unlaunched" {
+		return fmt.Errorf("%w: recovery preparation never dispatched; original publication remains unknown", ErrResyncUnconfirmed)
+	}
 	err = a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
 		applyRecord(req, current)
 		if err := utils.CloseExecutionFence(ctx, req); err != nil {

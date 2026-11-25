@@ -56,6 +56,7 @@ func runtimeDockerRequest(command types.Command) *types.ExecutionRequest {
 		WorkflowID: "stable-operation", RunID: "owner-run", LaunchID: "data-launch", RuntimeID: "runtime-a", JobID: 42,
 		Command: command, ConnectorType: "postgres", Version: "v1", AllowLaunch: true, Controlled: true,
 		BeforeLaunch:   func(context.Context) error { return nil },
+		BeginLaunch:    func(ctx context.Context) error { return nil },
 		RecordResource: func(context.Context, string, string) error { return nil },
 	}
 }
@@ -64,6 +65,7 @@ func TestControlledDockerRecordsIdentityBeforeStart(t *testing.T) {
 	req := runtimeDockerRequest(types.Resync)
 	var events []string
 	req.BeforeLaunch = func(context.Context) error { events = append(events, "authorize"); return nil }
+	req.BeginLaunch = req.BeforeLaunch
 	req.RecordResource = func(_ context.Context, id, uid string) error {
 		events = append(events, "record")
 		if id != "immutable-id" || uid != "" {
@@ -106,6 +108,7 @@ func TestControlledDockerFencesCreateAndStart(t *testing.T) {
 				}
 				return nil
 			}
+			req.BeginLaunch = req.BeforeLaunch
 			req.RecordResource = func(context.Context, string, string) error {
 				if stopAt == "record" {
 					return closed
@@ -260,6 +263,7 @@ func TestDockerRuntimeConfigAndNamesDoNotUseStableWorkflow(t *testing.T) {
 		}
 		return nil
 	}
+	req.BeginLaunch = req.BeforeLaunch
 	var config container.Config
 	d := newRuntimeDocker(t, func(r *http.Request) (*http.Response, error) {
 		path := strings.TrimPrefix(r.URL.Path, "/v1.54")

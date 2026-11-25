@@ -74,10 +74,10 @@ func (d *DockerExecutor) findControlledContainer(ctx context.Context, req *types
 }
 
 func (d *DockerExecutor) createControlledContainer(ctx context.Context, req *types.ExecutionRequest, config *container.Config, host *container.HostConfig, name string) (string, error) {
-	if !req.AllowLaunch || req.BeforeLaunch == nil || req.RecordResource == nil {
+	if !req.AllowLaunch || req.BeginLaunch == nil || req.BeforeLaunch == nil || req.RecordResource == nil {
 		return "", fmt.Errorf("execution outcome unknown: Docker launch is not admitted")
 	}
-	if err := req.BeforeLaunch(ctx); err != nil {
+	if err := req.BeginLaunch(ctx); err != nil {
 		return "", err
 	}
 	created, err := d.client.ContainerCreate(ctx, client.ContainerCreateOptions{Config: config, HostConfig: host, Name: name})

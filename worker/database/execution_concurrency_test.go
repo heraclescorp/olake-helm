@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +40,13 @@ func admittedTestRequest(t *testing.T, ctx context.Context, db *DB, req *types.E
 	req.RuntimeID, req.LaunchID, req.LauncherAttemptID = r.RuntimeID, r.LaunchID, r.LauncherAttemptID
 	req.AllowLaunch = true
 	req.Controlled = r.Controlled
+	if req.Controlled {
+		_, dir := utils.GetExecutionDirAndSubDir(req)
+		t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+		require.NoError(t, utils.OpenExecutionFence(ctx, req))
+		require.NoError(t, db.BeginExecutionLaunch(ctx, req))
+		r.Phase = "admitted"
+	}
 	return r
 }
 func waitForExecutionAdvisoryWait(t *testing.T, ctx context.Context, db *DB) {
@@ -52,6 +59,28 @@ func waitForExecutionAdvisoryWait(t *testing.T, ctx context.Context, db *DB) {
 }
 
 func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, reset func(*testing.T) types.JobData, saved string) {
+	t.Run("cancelled preparation seals before any provider dispatch", func(t *testing.T) {
+		reset(t)
+		req := executionTestRequest("cancelled-preparation", "run", types.Sync)
+		require.NoError(t, db.AcquireJobExecution(ctx, req))
+		r, won, err := db.AdmitExecution(ctx, req, "attempt-1", "unlaunched-runtime")
+		require.NoError(t, err)
+		require.True(t, won)
+		require.Equal(t, "preparing", r.Phase)
+		req.Controlled, req.AllowLaunch = true, true
+		req.RuntimeID, req.LaunchID, req.LauncherAttemptID = r.RuntimeID, r.LaunchID, r.LauncherAttemptID
+		_, dir := utils.GetExecutionDirAndSubDir(req)
+		t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+		require.NoError(t, utils.OpenExecutionFence(ctx, req))
+		r, err = db.SealExecution(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, "unlaunched", r.Phase)
+		require.ErrorIs(t, db.BeginExecutionLaunch(ctx, req), ErrExecutionClosed)
+		require.ErrorIs(t, db.RecordExecutionResource(ctx, req, "late-pod", "late-uid"), ErrExecutionClosed)
+		require.NoError(t, utils.CloseExecutionFence(ctx, req))
+		require.NoError(t, db.FinishExecution(ctx, req, "not_dispatched"))
+		require.NoError(t, db.ReleaseJobExecution(ctx, req))
+	})
 	for _, catalog := range []string{"rest", "lakekeeper", "nessie", "s3tables", "unity", "polaris", "biglake", "horizon", "glue", ""} {
 		t.Run("canonical domain/"+catalog, func(t *testing.T) {
 			reset(t)
@@ -119,6 +148,9 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 		require.True(t, won)
 		req.RuntimeID, req.LaunchID, req.LauncherAttemptID = admitted.RuntimeID, admitted.LaunchID, admitted.LauncherAttemptID
 		req.AllowLaunch = true
+		req.Controlled = admitted.Controlled
+		require.NoError(t, utils.OpenExecutionFence(ctx, req))
+		require.NoError(t, db.BeginExecutionLaunch(ctx, req))
 		close(resume)
 		select {
 		case r := <-sealed:
@@ -157,13 +189,12 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 		require.NoError(t, err)
 		require.Equal(t, "closed", r.Phase)
 	})
-	t.Run("exactly one durable launcher among overlapping attempts", func(t *testing.T) {
+	t.Run("exactly one durable dispatch among overlapping preparations", func(t *testing.T) {
 		reset(t)
-		req := executionTestRequest("admission", "run", types.Resync)
+		req := executionTestRequest("contended-operation", "run", types.Sync)
 		require.NoError(t, db.AcquireJobExecution(ctx, req))
 		start := make(chan struct{})
 		var wg sync.WaitGroup
-		var winners atomic.Int32
 		results := make(chan *ExecutionRecord, 8)
 		failures := make(chan error, 8)
 		for i := range 8 {
@@ -171,13 +202,10 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				r, won, err := db.AdmitExecution(ctx, req, fmt.Sprintf("run/activity/%d", i), fmt.Sprintf("runtime-%d", i))
+				r, _, err := db.AdmitExecution(ctx, req, fmt.Sprintf("run/activity/%d", i), fmt.Sprintf("runtime-%d", i))
 				if err != nil {
 					failures <- err
 					return
-				}
-				if won {
-					winners.Add(1)
 				}
 				results <- r
 			}(i)
@@ -189,16 +217,28 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 		for err := range failures {
 			require.NoError(t, err)
 		}
-		require.Equal(t, int32(1), winners.Load())
-		identity := ""
+		current, err := db.GetExecution(ctx, req.JobID, req.WorkflowID)
+		require.NoError(t, err)
 		for r := range results {
-			if identity == "" {
-				identity = r.RuntimeID
+			attempt := *req
+			attempt.Controlled, attempt.AllowLaunch = true, true
+			attempt.RuntimeID, attempt.LaunchID, attempt.LauncherAttemptID = r.RuntimeID, r.LaunchID, r.LauncherAttemptID
+			_, dir := utils.GetExecutionDirAndSubDir(&attempt)
+			t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+			if r.RuntimeID != current.RuntimeID {
+				require.ErrorIs(t, db.BeginExecutionLaunch(ctx, &attempt), ErrExecutionClosed)
+				require.NoError(t, utils.RequireClosedExecutionFence(ctx, &attempt))
+				continue
 			}
-			require.Equal(t, identity, r.RuntimeID)
-			require.Equal(t, identity, r.LaunchID)
-			require.Equal(t, "admitted", r.Phase)
+			require.NoError(t, utils.OpenExecutionFence(ctx, &attempt))
+			require.NoError(t, db.BeginExecutionLaunch(ctx, &attempt))
+			require.ErrorIs(t, db.BeginExecutionLaunch(ctx, &attempt), ErrExecutionClosed)
 		}
+		attached, won, err := db.AdmitExecution(ctx, req, "late-retry", "must-not-dispatch")
+		require.NoError(t, err)
+		require.False(t, won)
+		require.Equal(t, current.RuntimeID, attached.RuntimeID)
+		require.Equal(t, "admitted", attached.Phase)
 	})
 	t.Run("new run adoption serializes cleanup and fences every old mutation", func(t *testing.T) {
 		reset(t)
@@ -429,7 +469,7 @@ func runExecutionConcurrencyTests(t *testing.T, ctx context.Context, db *DB, res
 			if outcome == "not_launched" {
 				require.NoError(t, db.AcquireJobExecution(ctx, old))
 			} else {
-				admittedTestRequest(t, ctx, db, old, "original-runtime")
+				admittedTestRequest(t, ctx, db, old, "original-runtime-"+outcome)
 			}
 			_, err := db.SealExecution(ctx, old)
 			require.NoError(t, err)

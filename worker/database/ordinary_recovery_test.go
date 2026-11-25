@@ -102,6 +102,9 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		require.True(t, won)
 		newer.Controlled, newer.RecoverOnly = r.Controlled, r.Outcome == "recovery"
 		newer.RuntimeID, newer.LaunchID, newer.LauncherAttemptID = r.RuntimeID, r.LaunchID, r.LauncherAttemptID
+		newer.AllowLaunch = true
+		require.NoError(t, utils.OpenExecutionFence(ctx, newer))
+		require.NoError(t, db.BeginExecutionLaunch(ctx, newer))
 		newer.ResourceID, newer.ResourceUID = "recovery-pod", "recovery-uid"
 		require.NoError(t, db.RecordExecutionResource(ctx, newer, newer.ResourceID, newer.ResourceUID))
 		_, err = db.SealExecution(ctx, newer)
@@ -119,6 +122,58 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 		require.NoError(t, err)
 		require.Equal(t, "closing", r.Phase)
 		require.Error(t, db.ReleaseJobExecution(ctx, req))
+	}
+	for _, mode := range []string{"valid", "missing reservation", "source changed", "old run not terminal"} {
+		t.Run("unresolved legacy recovery reservation/"+mode, func(t *testing.T) {
+			old, preparing := fixture(t)
+			require.NoError(t, db.AdoptExecution(ctx, old, preparing))
+			r, won, err := db.AdmitExecution(ctx, preparing, "legacy-launcher", old.RuntimeID+"-legacy-recovery")
+			require.NoError(t, err)
+			require.True(t, won)
+			preparing.Controlled, preparing.RecoverOnly, preparing.PriorRunTerminal = true, true, true
+			preparing.RuntimeID, preparing.LaunchID, preparing.LauncherAttemptID = r.RuntimeID, r.LaunchID, r.LauncherAttemptID
+			_, runtimeDir := utils.GetExecutionDirAndSubDir(preparing)
+			t.Cleanup(func() { require.NoError(t, os.RemoveAll(runtimeDir)) })
+			_, err = db.client.ExecContext(ctx, `UPDATE enrollment_job_execution_records SET phase='admitted' WHERE job_id=42`)
+			require.NoError(t, err)
+			_, err = db.SealExecution(ctx, preparing)
+			require.NoError(t, err)
+			require.NoError(t, utils.CloseExecutionFence(ctx, preparing))
+			if mode != "missing reservation" {
+				require.NoError(t, utils.WriteExecutionRetirementReservation(ctx, preparing, utils.ExecutionRetirementReservation{Version: 1, Kind: "kubernetes-name-reservation", WorkflowID: preparing.WorkflowID, RunID: preparing.RunID, RuntimeID: preparing.RuntimeID, LaunchID: preparing.LaunchID, Namespace: "test", Name: "runtime-name", UID: "distinct-reservation-uid"}))
+			}
+			if mode == "source changed" {
+				_, err = db.client.ExecContext(ctx, `UPDATE enrollment_source SET config='{"host":"changed"}'`)
+				require.NoError(t, err)
+			}
+			if mode == "old run not terminal" {
+				preparing.PriorRunTerminal = false
+			}
+			err = db.RecordExecutionReservation(ctx, preparing)
+			if mode != "valid" {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, db.RecordExecutionReservation(ctx, preparing))
+			require.Error(t, db.RecordExecutionResource(ctx, preparing, "late-original-pod", "late-original-uid"))
+			require.Error(t, db.FinishExecution(ctx, preparing, "settled"))
+			require.Error(t, db.AdoptExecution(ctx, preparing, executionTestRequest(old.WorkflowID, "new-clear", types.ClearDestination)))
+			successor := executionTestRequest(old.WorkflowID, "reserved-successor", types.Sync)
+			require.NoError(t, db.AdoptExecution(ctx, preparing, successor))
+			r, err = db.GetExecution(ctx, 42, old.WorkflowID)
+			require.NoError(t, err)
+			require.Equal(t, "unadmitted", r.Phase)
+			require.Equal(t, "recovery", r.Outcome)
+			require.Equal(t, old.LaunchID, r.LaunchID)
+			require.Empty(t, r.ResourceID)
+			require.Empty(t, r.ResourceUID)
+			require.Error(t, db.RecordExecutionResource(ctx, preparing, "late-original-pod", "late-original-uid"))
+			require.Error(t, db.UpdateJobState(ctx, 42, preparing.WorkflowID, preparing.RunID, recoveryDBFinal))
+			job, err := db.GetJobData(ctx, 42)
+			require.NoError(t, err)
+			require.Equal(t, recoveryDBBaseline, job.State)
+		})
 	}
 	for _, mode := range []string{"settles atomically", "candidate missing", "candidate changed", "original candidate changed", "saved checkpoint changed", "proof unavailable", "checkpoint transaction rolled back"} {
 		t.Run("backfill recovery preserves authoritative checkpoint/"+mode, func(t *testing.T) {
@@ -225,6 +280,10 @@ func runOrdinaryRecoveryDBTests(t *testing.T, ctx context.Context, db *DB, reset
 			require.NoError(t, err)
 			if won {
 				launches++
+				newer.Controlled, newer.AllowLaunch = r.Controlled, true
+				newer.RuntimeID, newer.LaunchID, newer.LauncherAttemptID = r.RuntimeID, r.LaunchID, r.LauncherAttemptID
+				require.NoError(t, utils.OpenExecutionFence(ctx, newer))
+				require.NoError(t, db.BeginExecutionLaunch(ctx, newer))
 			}
 			require.Equal(t, "runtime-0", r.RuntimeID)
 			require.Equal(t, old.LaunchID, r.LaunchID)

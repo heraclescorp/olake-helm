@@ -23,10 +23,13 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		return fmt.Errorf("unknown execution is outside ordinary sync recovery")
 	}
 	if err := a.RetireExecution(ctx, req); err != nil {
-		return err
+		if reserveErr := a.reserveOrdinaryRecovery(ctx, req); reserveErr != nil {
+			return fmt.Errorf("exact runtime retirement failed (%v); positive reservation blocked: %w", err, reserveErr)
+		}
 	}
 	return a.db.GuardExecution(ctx, req, func(ctx context.Context, record *database.ExecutionRecord) error {
-		if !record.Controlled || record.Phase != "closing" || req.ResourceID == "" || record.RuntimeID != req.RuntimeID || record.LaunchID != req.LaunchID || record.ResourceID != req.ResourceID || record.ResourceUID != req.ResourceUID {
+		unlaunched := (record.Phase == "unlaunched" || record.Phase == "reserved") && record.Outcome == "recovery" && record.RuntimeID != record.LaunchID && record.ResourceID == "" && record.ResourceUID == ""
+		if !record.Controlled || (!unlaunched && (record.Phase != "closing" || req.ResourceID == "")) || record.RuntimeID != req.RuntimeID || record.LaunchID != req.LaunchID || record.ResourceID != req.ResourceID || record.ResourceUID != req.ResourceUID {
 			return fmt.Errorf("ordinary recovery requires sealed admission and positively retired immutable resource")
 		}
 		if err := utils.RequireClosedExecutionFence(ctx, req); err != nil {
@@ -46,6 +49,9 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 			if err := utils.ValidateOrdinaryRecoveryJob(job, files, origin.SavedCheckpointSHA256()); err != nil {
 				return err
 			}
+			if unlaunched {
+				return nil
+			}
 			if err := utils.PreserveOrdinaryRecoveryServer(ctx, req, origin); err != nil {
 				return err
 			}
@@ -56,6 +62,9 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 			return err
 		} else if !errors.Is(originErr, fs.ErrNotExist) {
 			return originErr
+		}
+		if unlaunched {
+			return fmt.Errorf("undispatched recovery requires an existing immutable original-operation origin")
 		}
 		files, err := utils.ReadOrdinaryFrozenConfigs(ctx, req)
 		if err != nil {

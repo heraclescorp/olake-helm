@@ -70,6 +70,11 @@ type enrollmentActivityExecutor struct {
 }
 
 func (e *enrollmentActivityExecutor) Execute(ctx context.Context, req *types.ExecutionRequest) (*types.ExecutorResponse, error) {
+	if req.Controlled && req.AllowLaunch && req.BeginLaunch != nil {
+		if err := req.BeginLaunch(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return e.execute(ctx, req)
 }
 func (e *enrollmentActivityExecutor) CleanupAndPersistState(context.Context, *types.ExecutionRequest) error {

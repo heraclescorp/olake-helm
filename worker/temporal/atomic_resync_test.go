@@ -42,6 +42,11 @@ type atomicActivityExecutor struct {
 }
 
 func (e *atomicActivityExecutor) Execute(ctx context.Context, req *types.ExecutionRequest) (*types.ExecutorResponse, error) {
+	if req.Controlled && req.AllowLaunch && req.BeginLaunch != nil {
+		if err := req.BeginLaunch(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return e.execute(ctx, req)
 }
 func (e *atomicActivityExecutor) CleanupAndPersistState(ctx context.Context, req *types.ExecutionRequest) error {
