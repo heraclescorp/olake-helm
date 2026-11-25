@@ -373,13 +373,15 @@ func (k *KubernetesExecutor) CreatePodSpec(req *types.ExecutionRequest, workDir,
 			SecurityContext:              k.config.SecurityContext,
 			Containers: []corev1.Container{
 				{
-					Name:            "connector",
-					Image:           imageName,
-					ImagePullPolicy: corev1.PullAlways,
-					Command:         []string{},
-					Args:            req.Args,
-					VolumeMounts:    volumeMounts,
-					Resources:       resources,
+					Name:                     "connector",
+					Image:                    imageName,
+					ImagePullPolicy:          corev1.PullAlways,
+					TerminationMessagePath:   "/dev/termination-log",
+					TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+					Command:                  []string{},
+					Args:                     req.Args,
+					VolumeMounts:             volumeMounts,
+					Resources:                resources,
 					Env: []corev1.EnvVar{
 						{
 							Name:  "OLAKE_WORKFLOW_ID",

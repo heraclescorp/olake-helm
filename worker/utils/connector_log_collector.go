@@ -63,13 +63,13 @@ func NewConnectorLogCollector(ctx context.Context, workDir string, streamLogs Co
 	return collector, nil
 }
 
-// processLogLine parses a raw stream line, skips lines already processed before the stream's
-// checkpoint, writes the buffer, and advances the resume checkpoint (seq and timestamp of the
-// last processed line).
 func (c *ConnectorLogCollector) processLogLine(ctx context.Context, rawLogLine string, checkpoint *streamCheckpoint) error {
 	normalizedLogLine, ok := parsePodLogLine(rawLogLine)
 	if !ok {
 		return nil
+	}
+	if normalizedLogLine.PodLogTimestamp.IsZero() {
+		normalizedLogLine.PodLogTimestamp = c.lastPodLogTimestamp
 	}
 	if !checkpoint.accept(normalizedLogLine) {
 		return nil
@@ -77,9 +77,7 @@ func (c *ConnectorLogCollector) processLogLine(ctx context.Context, rawLogLine s
 	if err := c.buffer.WriteLine(ctx, normalizedLogLine); err != nil {
 		return err
 	}
-	if normalizedLogLine.Seq > 0 {
-		c.lastPodLogSeq.Store(normalizedLogLine.Seq)
-	}
+	c.lastPodLogSeq.Store(normalizedLogLine.Seq)
 	c.lastPodLogTimestamp = normalizedLogLine.PodLogTimestamp
 	return nil
 }

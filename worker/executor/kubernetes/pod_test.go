@@ -16,8 +16,26 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/datazip-inc/olake-helm/worker/constants"
+	executiontypes "github.com/datazip-inc/olake-helm/worker/types"
 	"github.com/datazip-inc/olake-helm/worker/utils/failure"
 )
+
+func TestConnectorPodRetainsTerminationLogFallback(t *testing.T) {
+	k := newIndicatorExecutor(fake.NewClientset())
+	for _, controlled := range []bool{false, true} {
+		req := controlledPodRequest(executiontypes.Sync)
+		req.Controlled = controlled
+		pod := controlledPod(t, k, req)
+		connector := pod.Spec.Containers[0]
+		if connector.Name != "connector" || connector.TerminationMessagePath != "/dev/termination-log" ||
+			connector.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+			t.Fatalf("controlled=%t connector termination settings: %+v", controlled, connector)
+		}
+		if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+			t.Fatalf("connector restart policy changed: %s", pod.Spec.RestartPolicy)
+		}
+	}
+}
 
 func TestMemoryLimitKey(t *testing.T) {
 	tests := []struct {

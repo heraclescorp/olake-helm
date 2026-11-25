@@ -42,14 +42,6 @@ type resumePoint struct {
 	chunkCounter        int    // highest uploaded chunk number; 0 if none exist yet
 }
 
-// streamCheckpoint skips log lines that were already uploaded when a stream is re-read from
-// its resume point (connector reconnect, final catch-up, resume after restart, worker recovery).
-// First read (no checkpoint seq): every line is accepted. Otherwise lines are skipped until the
-// checkpoint line (seq == checkpoint seq) shows up, or until log time passes the checkpoint
-// timestamp + 1s if it is missing; then every line is accepted. There is no seq ordering check,
-// so out-of-order lines after the checkpoint are kept.
-// Accepted tradeoffs: an out-of-order line printed before the checkpoint is skipped, and with the
-// checkpoint missing (e.g. log rotation) up to 1s of lines can be lost.
 type streamCheckpoint struct {
 	seq      uint64
 	deadline time.Time
@@ -66,6 +58,9 @@ func newStreamCheckpoint(seq uint64, timestamp time.Time) *streamCheckpoint {
 
 // accept reports whether the line should be written.
 func (c *streamCheckpoint) accept(normalizedLogLine podLogLineEntry) bool {
+	if normalizedLogLine.Seq == 0 {
+		return true
+	}
 	if c.reached {
 		return true
 	}
@@ -89,7 +84,6 @@ type logChunkMetadata struct {
 	seq       uint64
 }
 
-// podLogLineEntry is a parsed pod log line: JSON fields, k8s/docker timestamp, and normalized line text.
 type podLogLineEntry struct {
 	WorkflowID string `json:"workflowID"`
 	Command    string `json:"command"`
@@ -186,8 +180,6 @@ func loadResumePoint(ctx context.Context, workDir, logRelDir, prefix string) (re
 		if !ok {
 			continue
 		}
-		// Latest chunk wins: counter for the next chunk number, timestamp as the since cursor,
-		// and its last seen seq as the checkpoint (0 means no seq: resume accepts every line from since).
 		if meta.counter > resume.chunkCounter {
 			resume.chunkCounter = meta.counter
 			resume.lastPodLogTimestamp = meta.timestamp
@@ -302,10 +294,7 @@ func (b *PodLogBuffer) appendLine(normalizedLogLine podLogLineEntry) (shouldFlus
 	if !normalizedLogLine.PodLogTimestamp.IsZero() {
 		b.lastLocalLogTimestamp = normalizedLogLine.PodLogTimestamp
 	}
-	// Chunk seq is the last seen seq, not the max: it is the checkpoint a resumed stream skips to.
-	if normalizedLogLine.Seq > 0 {
-		b.lastLocalLogSeq = normalizedLogLine.Seq
-	}
+	b.lastLocalLogSeq = normalizedLogLine.Seq
 	size, err := b.currentBufferSize()
 	if err != nil {
 		// line is already in the buffer; flush so Flush stays the only uploader
@@ -368,24 +357,28 @@ func (b *PodLogBuffer) nextFilename(normalizedLogLine podLogLineEntry) string {
 	return fmt.Sprintf("%s%06d-%s%s%06d.log", b.filenamePrefix, b.counter, ts, logChunkSeqMarker, normalizedLogLine.Seq)
 }
 
-// NormalizePodLogLine strips docker/k8s prefixes and accepts only JSON log lines.
 func NormalizePodLogLine(rawLogLine string) (string, time.Time, bool) {
-	rawLogLine = strings.TrimRight(rawLogLine, "\r\n")
-	rawLogLine = stripansi.Strip(rawLogLine)
-	rawLogLine = strings.TrimSpace(rawLogLine)
-	if rawLogLine == "" {
-		return "", time.Time{}, false
-	}
-
-	jsonBody, podLogTimestamp, ok := ParsePodLogLineTimestamp(rawLogLine)
+	rawLogLine = strings.TrimSuffix(rawLogLine, "\n")
+	body, podLogTimestamp, ok := ParsePodLogLineTimestamp(rawLogLine)
 	if !ok {
+		body = rawLogLine
+	}
+	jsonBody := strings.TrimSpace(stripansi.Strip(body))
+	if json.Valid([]byte(jsonBody)) {
+		return jsonBody + "\n", podLogTimestamp, true
+	}
+	entry := struct {
+		Message string `json:"message"`
+		Time    string `json:"time,omitempty"`
+	}{Message: body}
+	if !podLogTimestamp.IsZero() {
+		entry.Time = podLogTimestamp.Format(time.RFC3339Nano)
+	}
+	normalizedLine, err := json.Marshal(entry)
+	if err != nil {
 		return "", time.Time{}, false
 	}
-	if jsonBody == "" || !json.Valid([]byte(jsonBody)) {
-		return "", time.Time{}, false
-	}
-	normalizedLine := jsonBody + "\n"
-	return normalizedLine, podLogTimestamp, true
+	return string(normalizedLine) + "\n", podLogTimestamp, true
 }
 
 func readPodLogStream(stream io.Reader, handleLine func(rawLogLine string) error) error {
@@ -417,7 +410,7 @@ func ParsePodLogLineTimestamp(rawLogLine string) (jsonBody string, ts time.Time,
 	if !podLogTimestampOK {
 		return rawLogLine, time.Time{}, false
 	}
-	return strings.TrimSpace(jsonBody), podLogTimestamp, true
+	return jsonBody, podLogTimestamp, true
 }
 
 // parseRFC3339 parses RFC3339 timestamps in nano formats.
