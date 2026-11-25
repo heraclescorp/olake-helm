@@ -106,7 +106,7 @@ func SetExecutionArgs(req *types.ExecutionRequest) {
 	for i := 0; i < len(req.Args); i++ {
 		flag, _, inline := strings.Cut(req.Args[i], "=")
 		switch flag {
-		case "--execution-id", "--execution-fence", "--execution-launch-id", "--resync-launch-id", "--ordinary-recovery-origin", "--ordinary-recovery-result":
+		case "--execution-id", "--execution-fence", "--execution-launch-id", "--resync-launch-id", "--ordinary-recovery-origin", "--ordinary-recovery-result", "--backfill-recovery-checkpoint":
 			if !inline && i+1 < len(req.Args) {
 				i++
 			}
@@ -125,6 +125,12 @@ func SetExecutionArgs(req *types.ExecutionRequest) {
 		req.Args = append(req.Args, "--execution-launch-id", req.LaunchID,
 			"--ordinary-recovery-origin", filepath.Join(constants.ContainerMountDir, OrdinaryRecoveryOriginFile),
 			"--ordinary-recovery-result", filepath.Join(constants.ContainerMountDir, OrdinaryRecoveryResultFile))
+		for _, config := range req.Configs {
+			if config.Name == BackfillRecoveryCheckpointFile {
+				req.Args = append(req.Args, "--backfill-recovery-checkpoint", filepath.Join(constants.ContainerMountDir, BackfillRecoveryCheckpointFile))
+				break
+			}
+		}
 	}
 	if req.Command == types.Resync {
 		req.Args = append(req.Args, "--resync-launch-id", req.LaunchID)

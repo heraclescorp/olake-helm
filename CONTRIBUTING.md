@@ -118,3 +118,13 @@ helm template olake helm/olake -f my-values.yaml
 ```
 
 For template or behavior changes, install the chart on a local cluster (kind, minikube or k3d) and describe what you checked in the pull request.
+
+### Worker execution recovery
+
+Controlled executions record `preparing` before configuration preparation and authorize provider creation only when the exact launcher atomically transitions to `admitted`. A canceled `preparing` execution can be sealed as `unlaunched`; existing `admitted` records are never migrated to that state from a missing pod or missing configuration.
+
+A terminal ordinary-recovery run with an unresolved Kubernetes UID may instead retain its exact pod name using a nonexecuting retirement-reservation pod. The worker records the reservation UID separately in `execution-retirement-reservation.json` and seals SQL authority as `reserved`. The reservation has a scheduling gate, a retention finalizer, disabled Istio injection, no service-account token or connector configuration, and distinct labels. It must remain in place: removing its finalizer or forcibly releasing its name invalidates the late-create fence. As with existing UID-specific cleanup, recovery relies on Kubernetes provider termination guarantees, not protection against privileged control-plane interference.
+
+Reservation authorizes only another proof-validated recovery of the same original operation. It does not supply an original pod UID, connector receipt, publication outcome, settlement, ownership release, or permission to clear a destination. Original source, destination, catalog and checkpoint bindings still apply.
+
+Target the launch-stage, retirement-reservation and activity-heartbeat regressions when changing this path. `TestCatalogEnrollmentLocalPostgres` also exercises SQL interleavings and requires `OLAKE_ENROLLMENT_TEST_DSN` pointing to an isolated localhost PostgreSQL instance.

@@ -146,3 +146,28 @@ func TestCheckpointDigestRejectsTrailingJSONAndPreservesLargeNumbers(t *testing.
 		require.Error(t, err)
 	}
 }
+
+func TestBackfillRecoveryCheckpointArgumentUsesOnlyExactRecoveryInput(t *testing.T) {
+	for _, command := range []types.Command{types.Sync, types.Resync, types.ClearDestination} {
+		for _, recoverOnly := range []bool{false, true} {
+			for _, controlled := range []bool{false, true} {
+				for _, name := range []string{"", "other/" + BackfillRecoveryCheckpointFile, BackfillRecoveryCheckpointFile + ".old", BackfillRecoveryCheckpointFile} {
+					req := executionFenceFixture(t)
+					req.Command, req.RecoverOnly, req.Controlled = command, recoverOnly, controlled
+					req.Configs = []types.JobConfig{{Name: name, Data: "synthetic"}, {Name: name, Data: "synthetic"}}
+					req.Args = []string{string(command), "--backfill-recovery-checkpoint=untrusted", "--backfill-recovery-checkpoint", "untrusted"}
+					SetExecutionArgs(req)
+					SetExecutionArgs(req)
+					joined := strings.Join(req.Args, " ")
+					require.NotContains(t, joined, "untrusted")
+					if command == types.Sync && recoverOnly && controlled && name == BackfillRecoveryCheckpointFile {
+						require.Equal(t, 1, strings.Count(joined, "--backfill-recovery-checkpoint"))
+						require.Contains(t, joined, "--backfill-recovery-checkpoint "+filepath.Join(constants.ContainerMountDir, BackfillRecoveryCheckpointFile))
+					} else {
+						require.NotContains(t, joined, "--backfill-recovery-checkpoint")
+					}
+				}
+			}
+		}
+	}
+}

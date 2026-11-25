@@ -16,11 +16,10 @@ import (
 var maxRuntimeMemoryQuantity = *resource.NewQuantity(math.MaxInt64, resource.DecimalSI)
 
 // RuntimeMemoryConfig reserves at least 20% of the container limit for native memory and headroom.
-// GoLimit and GoPercent are mutually exclusive; JavaPercent is always required.
+// GoLimit and GoPercent are mutually exclusive.
 type RuntimeMemoryConfig struct {
-	GoLimit     string `json:"goLimit,omitempty"`
-	GoPercent   int    `json:"goPercent,omitempty"`
-	JavaPercent int    `json:"javaPercent"`
+	GoLimit   string `json:"goLimit,omitempty"`
+	GoPercent int    `json:"goPercent,omitempty"`
 }
 
 func parseRuntimeMemory(raw json.RawMessage) (*RuntimeMemoryConfig, error) {
@@ -55,9 +54,6 @@ func (p RuntimeMemoryConfig) validate() (int64, error) {
 	if (p.GoLimit != "") == (p.GoPercent != 0) {
 		return 0, fmt.Errorf("runtimeMemory requires exactly one of goLimit or goPercent")
 	}
-	if p.JavaPercent < 1 || p.JavaPercent > 80 {
-		return 0, fmt.Errorf("runtimeMemory.javaPercent must be an integer in 1..80")
-	}
 	if p.GoLimit != "" {
 		quantity, err := resource.ParseQuantity(p.GoLimit)
 		if err != nil {
@@ -69,8 +65,8 @@ func (p RuntimeMemoryConfig) validate() (int64, error) {
 		}
 		return goBytes, nil
 	}
-	if p.GoPercent < 1 || p.GoPercent > 80 || p.GoPercent+p.JavaPercent > 80 {
-		return 0, fmt.Errorf("runtimeMemory percentages must be positive and total at most 80")
+	if p.GoPercent < 1 || p.GoPercent > 80 {
+		return 0, fmt.Errorf("runtimeMemory.goPercent must be an integer in 1..80")
 	}
 	return 0, nil
 }
@@ -103,13 +99,11 @@ func (p RuntimeMemoryConfig) resolve(resources corev1.ResourceRequirements) ([]c
 	if p.GoLimit == "" {
 		goBytes = memoryPercent(limitBytes, p.GoPercent)
 	}
-	// This comparison includes the JVM's fractional-byte percentage without rounding it down.
-	if goBytes <= 0 || goBytes > memoryPercent(limitBytes, 80-p.JavaPercent) {
-		return nil, fmt.Errorf("runtimeMemory Go and Java budgets must be positive and total at most 80%% of the container memory limit")
+	if goBytes <= 0 || goBytes > memoryPercent(limitBytes, 80) {
+		return nil, fmt.Errorf("runtimeMemory Go budget must be positive and at most 80%% of the container memory limit")
 	}
 	return []corev1.EnvVar{
 		{Name: "GOMEMLIMIT", Value: strconv.FormatInt(goBytes, 10)},
-		{Name: "OLAKE_JAVA_HEAP_PERCENT", Value: strconv.Itoa(p.JavaPercent)},
 	}, nil
 }
 

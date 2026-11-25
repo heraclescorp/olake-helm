@@ -128,6 +128,9 @@ func TestPublishedResyncWorkflowWithJSONBPostgres(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, admitted)
 		req.RuntimeID, req.LaunchID, req.Controlled = record.RuntimeID, record.LaunchID, record.Controlled
+		req.AllowLaunch, req.LauncherAttemptID = true, record.LauncherAttemptID
+		require.NoError(t, utils.OpenExecutionFence(ctx, req))
+		require.NoError(t, db.BeginExecutionLaunch(ctx, req))
 		_, err = db.SealExecution(ctx, req)
 		require.NoError(t, err)
 		require.NoError(t, db.GuardExecution(ctx, req, func(ctx context.Context, _ *database.ExecutionRecord) error {

@@ -25,6 +25,7 @@ type activityExecutor interface {
 	CleanupAndPersistState(context.Context, *types.ExecutionRequest) error
 	CleanupResync(context.Context, *types.ExecutionRequest, bool) error
 	RetireExecution(context.Context, *types.ExecutionRequest) error
+	RetireForClear(context.Context, *types.ExecutionRequest) error
 	PrepareOrdinaryRecovery(context.Context, *types.ExecutionRequest) error
 }
 
@@ -36,6 +37,7 @@ type activityDatabase interface {
 	AdmitExecution(context.Context, *types.ExecutionRequest, string, string) (*database.ExecutionRecord, bool, error)
 	GuardExecution(context.Context, *types.ExecutionRequest, func(context.Context, *database.ExecutionRecord) error) error
 	CheckLaunch(context.Context, *types.ExecutionRequest) error
+	BeginExecutionLaunch(context.Context, *types.ExecutionRequest) error
 	RecordExecutionResource(context.Context, *types.ExecutionRequest, string, string) error
 	AdoptExecution(context.Context, *types.ExecutionRequest, *types.ExecutionRequest) error
 	BeginHandoff(context.Context, *types.ExecutionRequest, string) error
@@ -69,8 +71,7 @@ func (a *Activity) ExecuteActivity(ctx context.Context, req *types.ExecutionRequ
 		"workflowID", req.WorkflowID,
 	)
 
-	activity.RecordHeartbeat(ctx, "executing %s activity", req.Command)
-	req.HeartbeatFunc = activity.RecordHeartbeat
+	defer activityHeartbeat(ctx, req)()
 
 	if req.Command == types.ClearDestination {
 		if err := a.acquireJobExecution(ctx, req); err != nil {
@@ -124,9 +125,7 @@ func (a *Activity) SyncActivity(ctx context.Context, req *types.ExecutionRequest
 	log := logger.Log(ctx)
 	log.Debug("executing sync activity", "jobID", req.JobID)
 
-	// Record heartbeat before execution
-	activity.RecordHeartbeat(ctx, "executing sync for job %d", req.JobID)
-	req.HeartbeatFunc = activity.RecordHeartbeat
+	defer activityHeartbeat(ctx, req)()
 
 	if err := a.acquireJobExecution(ctx, req); err != nil {
 		return nil, err
@@ -275,6 +274,7 @@ func logUserFailure(log tlog.Logger, msg failure.UserMessage) {
 }
 
 func (a *Activity) PostSyncActivity(ctx context.Context, req *types.ExecutionRequest, status syncStatus) error {
+	defer activityHeartbeat(ctx, req)()
 	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 	// After telemetry below, not in Cleanup: this activity still logs on the writer.
 	defer utils.ReleaseWorkerLogWriter(workDir)
@@ -317,6 +317,7 @@ func (a *Activity) PostSyncActivity(ctx context.Context, req *types.ExecutionReq
 
 // Ordinary clears restore and resume sync after cleanup.
 func (a *Activity) PostClearActivity(ctx context.Context, req *types.ExecutionRequest) error {
+	defer activityHeartbeat(ctx, req)()
 	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 	defer utils.ReleaseWorkerLogWriter(workDir)
 

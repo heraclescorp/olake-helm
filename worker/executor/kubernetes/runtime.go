@@ -27,6 +27,9 @@ func (k *KubernetesExecutor) podResourceName(req *types.ExecutionRequest) string
 }
 
 func validatePodOwnership(req *types.ExecutionRequest, pod *corev1.Pod) error {
+	if pod.Annotations["olake.io/resource-kind"] == retirementReservationKind || pod.Labels["olake.io/resource-kind"] == retirementReservationKind {
+		return fmt.Errorf("execution resource is a nonexecuting retirement reservation")
+	}
 	if pod.UID == "" || (req.ResourceID != "" && req.ResourceID != pod.Name) || (req.ResourceUID != "" && req.ResourceUID != string(pod.UID)) {
 		return fmt.Errorf("execution outcome unknown: Kubernetes immutable resource identity does not match")
 	}
@@ -52,14 +55,7 @@ func validatePodAttachment(pod *corev1.Pod) error {
 	if pod.DeletionTimestamp != nil {
 		return fmt.Errorf("execution outcome unknown: admitted Kubernetes resource is terminating")
 	}
-	// A pending pod with no evidence that the connector started is not proof of
-	// an execution. Only the original Create caller may wait for its first start.
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name == "connector" && (status.State.Running != nil || status.State.Terminated != nil) {
-			return nil
-		}
-	}
-	return fmt.Errorf("execution outcome unknown: admitted Kubernetes resource has not completed a confirmed start")
+	return nil
 }
 
 func (k *KubernetesExecutor) findControlledPod(ctx context.Context, req *types.ExecutionRequest) (*corev1.Pod, error) {
@@ -88,10 +84,10 @@ func (k *KubernetesExecutor) findControlledPod(ctx context.Context, req *types.E
 }
 
 func (k *KubernetesExecutor) createControlledPod(ctx context.Context, req *types.ExecutionRequest, spec *corev1.Pod) (*corev1.Pod, error) {
-	if !req.AllowLaunch || req.BeforeLaunch == nil || req.RecordResource == nil {
+	if !req.AllowLaunch || req.BeginLaunch == nil || req.RecordResource == nil {
 		return nil, fmt.Errorf("execution outcome unknown: Kubernetes launch is not admitted")
 	}
-	if err := req.BeforeLaunch(ctx); err != nil {
+	if err := req.BeginLaunch(ctx); err != nil {
 		return nil, err
 	}
 	pod, err := k.client.CoreV1().Pods(k.namespace).Create(ctx, spec, metav1.CreateOptions{})

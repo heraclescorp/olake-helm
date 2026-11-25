@@ -36,11 +36,17 @@ type atomicActivityExecutor struct {
 	cleanup          func(bool) error
 	cleanupRequest   func(context.Context, *types.ExecutionRequest, bool) error
 	retire           func(context.Context, *types.ExecutionRequest) error
+	retireForClear   func(context.Context, *types.ExecutionRequest) error
 	ordinaryCleanup  func(context.Context, *types.ExecutionRequest) error
 	ordinaryRecovery func(context.Context, *types.ExecutionRequest) error
 }
 
 func (e *atomicActivityExecutor) Execute(ctx context.Context, req *types.ExecutionRequest) (*types.ExecutorResponse, error) {
+	if req.Controlled && req.AllowLaunch && req.BeginLaunch != nil {
+		if err := req.BeginLaunch(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return e.execute(ctx, req)
 }
 func (e *atomicActivityExecutor) CleanupAndPersistState(ctx context.Context, req *types.ExecutionRequest) error {
@@ -63,6 +69,12 @@ func (e *atomicActivityExecutor) RetireExecution(ctx context.Context, req *types
 		return nil
 	}
 	return e.retire(ctx, req)
+}
+func (e *atomicActivityExecutor) RetireForClear(ctx context.Context, req *types.ExecutionRequest) error {
+	if e.retireForClear == nil {
+		return context.Canceled
+	}
+	return e.retireForClear(ctx, req)
 }
 func (e *atomicActivityExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest) error {
 	if e.ordinaryRecovery == nil {

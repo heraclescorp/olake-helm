@@ -33,6 +33,8 @@ func (db *executionTestAuthority) SealExecution(_ context.Context, req *types.Ex
 		db.record.Outcome = "not_launched"
 	} else if db.record.Phase == "admitted" {
 		db.record.Phase = "closing"
+	} else if db.record.Phase == "preparing" {
+		db.record.Phase = "unlaunched"
 	}
 	return db.record, nil
 }

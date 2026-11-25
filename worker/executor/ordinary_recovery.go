@@ -23,11 +23,17 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		return fmt.Errorf("unknown execution is outside ordinary sync recovery")
 	}
 	if err := a.RetireExecution(ctx, req); err != nil {
-		return err
+		if reserveErr := a.reserveOrdinaryRecovery(ctx, req); reserveErr != nil {
+			return fmt.Errorf("exact runtime retirement failed (%v); positive reservation blocked: %w", err, reserveErr)
+		}
 	}
 	return a.db.GuardExecution(ctx, req, func(ctx context.Context, record *database.ExecutionRecord) error {
-		if !record.Controlled || record.Phase != "closing" || req.ResourceID == "" {
+		unlaunched := (record.Phase == "unlaunched" || record.Phase == "reserved") && record.Outcome == "recovery" && record.RuntimeID != record.LaunchID && record.ResourceID == "" && record.ResourceUID == ""
+		if !record.Controlled || (!unlaunched && (record.Phase != "closing" || req.ResourceID == "")) || record.RuntimeID != req.RuntimeID || record.LaunchID != req.LaunchID || record.ResourceID != req.ResourceID || record.ResourceUID != req.ResourceUID {
 			return fmt.Errorf("ordinary recovery requires sealed admission and positively retired immutable resource")
+		}
+		if err := utils.RequireClosedExecutionFence(ctx, req); err != nil {
+			return err
 		}
 		reader, ok := a.db.(interface {
 			GetJobData(context.Context, int) (types.JobData, error)
@@ -39,13 +45,22 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		if err != nil {
 			return err
 		}
-		if origin, _, files, originErr := utils.ReadOrdinaryRecoveryOrigin(ctx, req); originErr == nil {
-			if err := utils.ValidateOrdinaryRecoveryJob(job, files, origin.BaselineStateSHA256); err != nil {
+		if origin, baseline, files, originErr := utils.ReadOrdinaryRecoveryOrigin(ctx, req); originErr == nil {
+			if err := utils.ValidateOrdinaryRecoveryJob(job, files, origin.SavedCheckpointSHA256()); err != nil {
 				return err
 			}
-			return utils.PreserveOrdinaryRecoveryServer(ctx, req, origin)
+			if unlaunched {
+				return nil
+			}
+			if err := utils.PreserveOrdinaryRecoveryServer(ctx, req, origin); err != nil {
+				return err
+			}
+			return utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files)
 		} else if !errors.Is(originErr, fs.ErrNotExist) {
 			return originErr
+		}
+		if unlaunched {
+			return fmt.Errorf("undispatched recovery requires an existing immutable original-operation origin")
 		}
 		files, err := utils.ReadOrdinaryFrozenConfigs(ctx, req)
 		if err != nil {
@@ -59,31 +74,54 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		if receipt != "" {
 			receiptSHA = utils.RawSHA256(receipt)
 		}
-		_, stableDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
-		// A crash between these two create-only publications is retried against
-		// the same baseline, never silently replaced by a later DB checkpoint.
-		if _, err := storage.CreateFileIfAbsent(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, job.State); err != nil {
-			return err
-		}
-		baseline, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, false)
+		savedSHA, err := utils.StateSHA256(job.State)
 		if err != nil {
 			return err
+		}
+		if err := utils.ValidateOrdinaryRecoveryJob(job, files, savedSHA); err != nil {
+			return err
+		}
+		_, stableDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
+		_, frozenErr := storage.ReadFile(ctx, stableDir, utils.BackfillRecoveryCheckpointFile, false)
+		if frozenErr != nil && !errors.Is(frozenErr, fs.ErrNotExist) {
+			return frozenErr
+		}
+		baseline := job.State
+		backfill, candidateSHA := false, ""
+		_, _, selectionErr := utils.OrdinaryRecoverySelection(files, baseline)
+		if frozenErr == nil || selectionErr != nil {
+			candidate, data, candidateErr := utils.FreezeBackfillRecoveryCheckpoint(ctx, req, files, job.State)
+			if candidateErr != nil {
+				return candidateErr
+			}
+			baseline, backfill, candidateSHA = string(candidate.State), true, utils.RawSHA256(data)
 		}
 		baselineSHA, err := utils.StateSHA256(baseline)
 		if err != nil {
 			return err
 		}
-		if err := utils.ValidateOrdinaryRecoveryJob(job, files, baselineSHA); err != nil {
+		if _, err := storage.CreateFileIfAbsent(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, baseline); err != nil {
 			return err
 		}
-		if _, _, err := utils.OrdinaryRecoverySelection(files, baseline); err != nil {
+		persistedBaseline, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryBaselineFile, false)
+		if err != nil {
 			return err
+		}
+		persistedSHA, err := utils.StateSHA256(persistedBaseline)
+		if err != nil {
+			return err
+		}
+		if persistedSHA != baselineSHA {
+			return fmt.Errorf("immutable ordinary recovery baseline conflicts with validated evidence; job remains paused and owned; do not overwrite the baseline or reset ownership")
 		}
 		catalogSHA, err := utils.OrdinaryCatalogSHA256(files)
 		if err != nil {
 			return err
 		}
-		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: req.LaunchID, OriginalLaunchID: req.LaunchID, OriginalReceiptSHA256: receiptSHA, SourceSHA256: utils.RawSHA256(files["source.json"]), DestinationSHA256: utils.RawSHA256(files["destination.json"]), CatalogSHA256: catalogSHA, BaselineStateSHA256: baselineSHA}
+		origin := utils.OrdinaryRecoveryOrigin{Version: 1, OriginalExecutionID: req.LaunchID, OriginalLaunchID: req.LaunchID, OriginalReceiptSHA256: receiptSHA, SourceSHA256: utils.RawSHA256(files["source.json"]), DestinationSHA256: utils.RawSHA256(files["destination.json"]), CatalogSHA256: catalogSHA, BaselineStateSHA256: baselineSHA, Backfill: backfill, BackfillCheckpointSHA256: candidateSHA}
+		if backfill {
+			origin.SavedStateSHA256 = savedSHA
+		}
 		data, err := json.Marshal(origin)
 		if err != nil {
 			return err
@@ -106,7 +144,7 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		if err := utils.PreserveOrdinaryRecoveryServer(ctx, req, origin); err != nil {
 			return err
 		}
-		return nil
+		return utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files)
 	})
 }
 
@@ -128,7 +166,7 @@ func (a *AbstractExecutor) ordinaryRecoveryInputs(ctx context.Context, req *type
 	if err != nil {
 		return err
 	}
-	if err := utils.ValidateOrdinaryRecoveryJob(job, files, origin.BaselineStateSHA256); err != nil {
+	if err := utils.ValidateOrdinaryRecoveryJob(job, files, origin.SavedCheckpointSHA256()); err != nil {
 		return err
 	}
 	data, err := json.Marshal(origin)
@@ -137,6 +175,21 @@ func (a *AbstractExecutor) ordinaryRecoveryInputs(ctx context.Context, req *type
 	}
 	req.TempPath, req.OutputFile = "", "state.json"
 	req.Configs = []types.JobConfig{{Name: "state.json", Data: baseline}, {Name: utils.OrdinaryRecoveryOriginFile, Data: string(data)}, {Name: utils.OrdinaryRecoveryBaselineFile, Data: baseline}}
+	if origin.Backfill {
+		_, candidate, err := utils.ReadBackfillRecoveryCheckpoint(ctx, req, files)
+		if err != nil {
+			return err
+		}
+		if utils.RawSHA256(candidate) != origin.BackfillCheckpointSHA256 {
+			return fmt.Errorf("original backfill candidate differs from immutable origin")
+		}
+		req.Configs = append(req.Configs, types.JobConfig{Name: utils.BackfillRecoveryCheckpointFile, Data: candidate})
+		bindings, err := utils.BackfillRecoveryBindingConfigs(ctx, req, origin, baseline, files)
+		if err != nil {
+			return err
+		}
+		req.Configs = append(req.Configs, bindings...)
+	}
 	_, stableDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, types.Sync)
 	server, err := storage.ReadFile(ctx, stableDir, utils.OrdinaryRecoveryServerFile, false)
 	if err == nil {
@@ -199,6 +252,15 @@ func confirmedOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest)
 	if runtimeBaselineSHA != origin.BaselineStateSHA256 {
 		return "", fmt.Errorf("recovery runtime baseline evidence changed")
 	}
+	if origin.Backfill {
+		candidate, err := storage.ReadFile(ctx, dir, utils.BackfillRecoveryCheckpointFile, false)
+		if err != nil {
+			return "", err
+		}
+		if utils.RawSHA256(candidate) != origin.BackfillCheckpointSHA256 {
+			return "", fmt.Errorf("recovery runtime backfill candidate differs from immutable origin")
+		}
+	}
 	state, outcome, err := confirmedExecutionResult(ctx, req)
 	if err != nil {
 		return "", err
@@ -229,6 +291,15 @@ func confirmedOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest)
 	if err != nil {
 		return "", err
 	}
+	if origin.Backfill {
+		candidate, _, err := utils.ReadBackfillRecoveryCheckpoint(ctx, req, files)
+		if err != nil {
+			return "", err
+		}
+		if server.ServerIdentity != candidate.ServerIdentity || server.SlotName != candidate.SlotName {
+			return "", fmt.Errorf("recovery result PostgreSQL identity differs from original backfill candidate")
+		}
+	}
 	if server.ServerIdentity != result.ServerIdentity || server.SlotName != result.SlotName {
 		return "", fmt.Errorf("ordinary recovery result does not bind pinned PostgreSQL server/slot")
 	}
@@ -248,7 +319,11 @@ func confirmedOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest)
 	if result.ToastValueSemantics != "current_source_lookup" && result.ToastValueSemantics != "destination" {
 		return "", fmt.Errorf("ordinary recovery result has unknown TOAST value semantics")
 	}
-	selected, lowerLSN, err := utils.OrdinaryRecoverySelection(files, baseline)
+	selectBaseline := utils.OrdinaryRecoverySelection
+	if origin.Backfill {
+		selectBaseline = utils.OrdinaryBackfillRecoverySelection
+	}
+	selected, lowerLSN, err := selectBaseline(files, baseline)
 	if err != nil {
 		return "", err
 	}
@@ -285,6 +360,14 @@ func confirmedOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest)
 			return "", fmt.Errorf("recovery table proof is incomplete, duplicated or not at common target")
 		}
 		seen[table.Stream] = true
+	}
+	if origin.Backfill {
+		if err := utils.ValidateBackfillRecoveryFinalState(files, baseline, *state, result.Tables); err != nil {
+			return "", err
+		}
+		if err := utils.ValidateBackfillRecoveryBindingProofs(ctx, req, origin, baseline, files, *state); err != nil {
+			return "", err
+		}
 	}
 	return *state, nil
 }

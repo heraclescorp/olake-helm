@@ -21,24 +21,38 @@ type executionResult struct {
 	StateSHA256 string `json:"state_sha256"`
 }
 
+// readExecutionResult binds the immutable receipt before trusting its command.
+// Ordinary asynchronous commands share a runtime directory, not an operation type.
+func readExecutionResult(ctx context.Context, req *types.ExecutionRequest) (*executionResult, error) {
+	_, dir := utils.GetExecutionDirAndSubDir(req)
+	data, err := storage.ReadFile(ctx, dir, executionResultFile, false)
+	if err != nil {
+		return nil, fmt.Errorf("execution retirement is unknown; retain job ownership: %w", err)
+	}
+	var proof executionResult
+	if err := json.Unmarshal([]byte(data), &proof); err != nil {
+		return nil, fmt.Errorf("invalid execution retirement receipt: %w", err)
+	}
+	if proof.Version != 1 || req.RuntimeID == "" || req.LaunchID == "" || proof.ExecutionID != req.RuntimeID || proof.LaunchID != req.LaunchID || (proof.Command != string(types.Sync) && proof.Command != string(types.ClearDestination)) {
+		return nil, fmt.Errorf("execution retirement receipt does not bind admitted ordinary runtime, launch and command")
+	}
+	return &proof, nil
+}
+
 // Process exit/absence is not evidence that remotely dispatched mutations have
 // settled. Only the terminal source/JVM receipt can authorize ordinary release.
 func confirmedExecutionResult(ctx context.Context, req *types.ExecutionRequest) (state *string, outcome string, err error) {
 	if req.Command != types.Sync && req.Command != types.ClearDestination {
 		return nil, "", fmt.Errorf("ordinary retirement requires sync or clear-destination")
 	}
-	_, dir := utils.GetExecutionDirAndSubDir(req)
-	data, err := storage.ReadFile(ctx, dir, executionResultFile, false)
+	proof, err := readExecutionResult(ctx, req)
 	if err != nil {
-		return nil, "", fmt.Errorf("execution retirement is unknown; retain job ownership: %w", err)
+		return nil, "", err
 	}
-	var proof executionResult
-	if err := json.Unmarshal([]byte(data), &proof); err != nil {
-		return nil, "", fmt.Errorf("invalid execution retirement receipt: %w", err)
-	}
-	if proof.Version != 1 || req.RuntimeID == "" || req.LaunchID == "" || proof.ExecutionID != req.RuntimeID || proof.LaunchID != req.LaunchID || proof.Command != string(req.Command) {
+	if proof.Command != string(req.Command) {
 		return nil, "", fmt.Errorf("execution retirement receipt does not bind admitted runtime, launch and command")
 	}
+	_, dir := utils.GetExecutionDirAndSubDir(req)
 	switch proof.Outcome {
 	case "not_started":
 		return nil, proof.Outcome, nil

@@ -146,6 +146,8 @@ type UserMessage struct {
 const (
 	tipIncreaseMemory = "Recommendation: Increase the memory/resources allocated to the OLake sync pod and retry the sync."
 	tipEvictedMemory  = "Recommendation: The sync ran out of available memory. Try increasing the memory/resources allocated to the OLake sync pod and retry the sync."
+	tipEvictedStorage = "Recommendation: Increase the OLake sync pod's ephemeral-storage request/limit and ensure the node has sufficient free disk capacity, then retry the sync."
+	tipEvictedUnknown = "Recommendation: Review the Kubernetes eviction details and node resource pressure, address the reported cause, then retry the sync."
 )
 
 // Describe builds the user-facing message for a failure. Failures without a
@@ -161,8 +163,8 @@ func Describe(f *ExecutionFailure) UserMessage {
 		msg.Tip = tipIncreaseMemory
 	case CategoryEvicted:
 		msg.Headline = "Sync failed because Kubernetes evicted the sync pod (resource limit or node pressure)."
-		msg.Details = fmt.Sprintf("Details: %s %s evicted%s: %q", f.Kind, f.Name, onNode(f), strings.TrimSpace(f.Message))
-		msg.Tip = tipEvictedMemory
+		msg.Details = fmt.Sprintf("Details: %s %s evicted%s: %q", f.Kind, f.Name, onNode(f), f.Message)
+		msg.Tip = evictionTip(f.Message)
 	default:
 		if f.ExitCode != nil {
 			msg.Headline = fmt.Sprintf("Sync failed: connector exited with code %d. See Sync logs for the error.", *f.ExitCode)
@@ -171,6 +173,18 @@ func Describe(f *ExecutionFailure) UserMessage {
 		}
 	}
 	return msg
+}
+
+func evictionTip(message string) string {
+	message = strings.ToLower(message)
+	switch {
+	case containsAny(message, []string{"ephemeral-storage", "ephemeral storage", "local storage", "diskpressure", "disk pressure", "disk-pressure", "nodefs", "imagefs", "containerfs"}):
+		return tipEvictedStorage
+	case strings.Contains(message, "memory"):
+		return tipEvictedMemory
+	default:
+		return tipEvictedUnknown
+	}
 }
 
 func oomDetails(f *ExecutionFailure) string {

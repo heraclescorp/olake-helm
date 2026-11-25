@@ -52,7 +52,7 @@ func (db *activityTestAuthority) GetExecution(_ context.Context, _ int, id strin
 	}
 	return r, nil
 }
-func (db *activityTestAuthority) AdmitExecution(_ context.Context, req *types.ExecutionRequest, attempt, _ string) (*database.ExecutionRecord, bool, error) {
+func (db *activityTestAuthority) AdmitExecution(_ context.Context, req *types.ExecutionRequest, attempt, runtimeID string) (*database.ExecutionRecord, bool, error) {
 	r := db.records[req.WorkflowID]
 	if r == nil || r.OwnerRunID != req.RunID {
 		return nil, false, database.ErrJobExecutionOwned
@@ -65,12 +65,18 @@ func (db *activityTestAuthority) AdmitExecution(_ context.Context, req *types.Ex
 	}
 	// Fixture identities are deterministic so old artifact-focused tests can name
 	// their directory, without relying on Temporal's random attempt generation.
-	r.Phase = "admitted"
+	r.Phase = "preparing"
+	if !r.Controlled {
+		r.Phase = "admitted"
+	}
 	r.LauncherAttemptID = attempt
 	if r.Controlled {
 		r.RuntimeID = req.WorkflowID
+		if req.Command == types.ClearDestination {
+			r.RuntimeID = runtimeID
+		}
 		if r.LaunchID == "" {
-			r.LaunchID = req.WorkflowID
+			r.LaunchID = r.RuntimeID
 		}
 	}
 	return r, true, nil
@@ -86,11 +92,22 @@ func (db *activityTestAuthority) GuardExecution(ctx context.Context, req *types.
 }
 func (db *activityTestAuthority) CheckLaunch(ctx context.Context, req *types.ExecutionRequest) error {
 	return db.GuardExecution(ctx, req, func(ctx context.Context, r *database.ExecutionRecord) error {
-		if r.Phase != "admitted" || !req.AllowLaunch || r.LauncherAttemptID != req.LauncherAttemptID {
+		if (r.Phase != "preparing" && r.Phase != "admitted") || !req.AllowLaunch || r.LauncherAttemptID != req.LauncherAttemptID {
 			return database.ErrExecutionClosed
 		}
 		return utils.ReadExecutionFence(ctx, req)
 	})
+}
+func (db *activityTestAuthority) BeginExecutionLaunch(ctx context.Context, req *types.ExecutionRequest) error {
+	if err := db.CheckLaunch(ctx, req); err != nil {
+		return err
+	}
+	r := db.records[req.WorkflowID]
+	if r.Phase != "preparing" {
+		return database.ErrExecutionClosed
+	}
+	r.Phase = "admitted"
+	return nil
 }
 func (db *activityTestAuthority) RecordExecutionResource(_ context.Context, req *types.ExecutionRequest, id, uid string) error {
 	r := db.records[req.WorkflowID]
@@ -103,10 +120,36 @@ func (db *activityTestAuthority) RecordExecutionResource(_ context.Context, req 
 	r.ResourceID, r.ResourceUID = id, uid
 	return nil
 }
-func (db *activityTestAuthority) AdoptExecution(_ context.Context, old, newReq *types.ExecutionRequest) error {
+func (db *activityTestAuthority) AdoptExecution(ctx context.Context, old, newReq *types.ExecutionRequest) error {
 	r := db.records[old.WorkflowID]
 	if r == nil || r.OwnerRunID != old.RunID || db.owner != old.WorkflowID || db.run != old.RunID {
 		return database.ErrJobExecutionOwned
+	}
+	if newReq.Command == types.ClearDestination && (r.Controlled || r.LaunchID != "") {
+		if !r.Controlled || old.RuntimeID != r.RuntimeID || old.LaunchID != r.LaunchID || old.LauncherAttemptID != r.LauncherAttemptID || old.ResourceID != r.ResourceID || old.ResourceUID != r.ResourceUID || r.Phase != "closed" || r.HandoffToken != "" || r.HandoffRequestID != "" || r.HandoffRunID != "" || r.HandoffActive {
+			return database.ErrExecutionClosed
+		}
+		switch r.Outcome {
+		case "settled", "not_started", "not_launched", "retired":
+		default:
+			return fmt.Errorf("ordinary outcome is not proven")
+		}
+		if r.Outcome == "not_launched" {
+			if r.LaunchID != "" || r.RuntimeID != "" || r.LauncherAttemptID != "" || r.ResourceID != "" || r.ResourceUID != "" {
+				return database.ErrExecutionClosed
+			}
+		} else {
+			if r.LaunchID == "" || r.RuntimeID == "" || (old.Command != types.Sync && old.Command != types.ClearDestination) {
+				return database.ErrExecutionClosed
+			}
+			if err := utils.RequireClosedExecutionFence(ctx, old); err != nil {
+				return err
+			}
+		}
+		r.OwnerRunID, r.Phase, r.Outcome = newReq.RunID, "unadmitted", ""
+		r.RuntimeID, r.LaunchID, r.LauncherAttemptID, r.ResourceID, r.ResourceUID = "", "", "", "", ""
+		db.run = newReq.RunID
+		return nil
 	}
 	retiredWithoutPublication := r.Phase == "closed" && (r.Outcome == "not_launched" || r.Outcome == "retired" || (newReq.Command == types.Resync && r.Outcome == "not_published"))
 	if retiredWithoutPublication || (newReq.Command != types.Resync && r.LaunchID != "") {

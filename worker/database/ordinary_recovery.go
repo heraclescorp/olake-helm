@@ -23,7 +23,7 @@ func (db *DB) ordinaryRecoveryBinding(ctx context.Context, tx *sql.Tx, req *type
 	if err != nil {
 		return err
 	}
-	return utils.ValidateOrdinaryRecoveryJob(job, files, origin.BaselineStateSHA256)
+	return utils.ValidateOrdinaryRecoveryJob(job, files, origin.SavedCheckpointSHA256())
 }
 
 // CompleteOrdinaryRecovery has one DB commit point: a lost acknowledgement can

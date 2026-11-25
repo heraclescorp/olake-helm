@@ -27,6 +27,7 @@ type ExecutionRequest struct {
 	AllowLaunch              bool                                        `json:"-"`
 	Controlled               bool                                        `json:"-"`
 	RecoverOnly              bool                                        `json:"recover_only,omitempty"`
+	PriorRunTerminal         bool                                        `json:"-"`
 	ResourceID               string                                      `json:"resource_id,omitempty"`
 	ResourceUID              string                                      `json:"resource_uid,omitempty"`
 	AfterResyncOperationID   string                                      `json:"after_resync_operation_id,omitempty"`
@@ -34,6 +35,7 @@ type ExecutionRequest struct {
 	AfterResyncTransferToken string                                      `json:"after_resync_transfer_token,omitempty"`
 	AfterResyncStateSHA256   string                                      `json:"after_resync_state_sha256,omitempty"`
 	BeforeLaunch             func(context.Context) error                 `json:"-"`
+	BeginLaunch              func(context.Context) error                 `json:"-"`
 	RecordResource           func(context.Context, string, string) error `json:"-"`
 	JobID                    int                                         `json:"job_id"`
 	ProjectID                string                                      `json:"project_id"`

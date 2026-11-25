@@ -24,7 +24,14 @@ func executionRequestFromRecord(req *types.ExecutionRequest, r *database.Executi
 	req.Controlled = r.Controlled
 }
 
-func (a *Activity) acquireJobExecution(ctx context.Context, req *types.ExecutionRequest) error {
+func (a *Activity) acquireJobExecution(ctx context.Context, req *types.ExecutionRequest) (result error) {
+	defer func() {
+		if result != nil && ctx.Err() == nil {
+			if err := a.db.AcquireJobExecution(ctx, req); err == nil {
+				result = nil
+			}
+		}
+	}()
 	err := a.db.AcquireJobExecution(ctx, req)
 	if err == nil {
 		return nil
@@ -59,6 +66,16 @@ func (a *Activity) acquireJobExecution(ctx context.Context, req *types.Execution
 	old := *req
 	old.RunID = r.OwnerRunID
 	executionRequestFromRecord(&old, r)
+	old.PriorRunTerminal = true
+	if req.Command == types.ClearDestination && r.Controlled {
+		if err := a.executor.RetireForClear(ctx, &old); err != nil {
+			return fmt.Errorf("prior execution cannot be safely retired for clear: %w", err)
+		}
+		if err := a.db.AdoptExecution(ctx, &old, req); err != nil {
+			return err
+		}
+		return a.db.AcquireJobExecution(ctx, req)
+	}
 	if req.Command != types.Resync && (r.LaunchID != "" || !r.Controlled) {
 		if err := a.executor.CleanupAndPersistState(ctx, &old); err != nil {
 			if req.Command != types.Sync || !r.Controlled {
@@ -97,16 +114,18 @@ func (a *Activity) prepareExecution(ctx context.Context, req *types.ExecutionReq
 	executionRequestFromRecord(req, r)
 	req.AllowLaunch = admitted
 	req.BeforeLaunch = nil
+	req.BeginLaunch = nil
 	req.RecordResource = nil
 	if req.Controlled {
 		req.BeforeLaunch = func(ctx context.Context) error { return a.db.CheckLaunch(ctx, req) }
+		req.BeginLaunch = func(ctx context.Context) error { return a.db.BeginExecutionLaunch(ctx, req) }
 		req.RecordResource = func(ctx context.Context, id, uid string) error {
 			return a.db.RecordExecutionResource(ctx, req, id, uid)
 		}
 	}
 	if admitted && req.Controlled {
 		if err := a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
-			if current.Phase != "admitted" || current.LauncherAttemptID != attempt {
+			if current.Phase != "preparing" || current.LauncherAttemptID != attempt {
 				return database.ErrExecutionClosed
 			}
 			if err := utils.OpenExecutionFence(ctx, req); err != nil {
@@ -129,8 +148,7 @@ func (a *Activity) ResyncActivity(ctx context.Context, req *types.ExecutionReque
 	if _, err := utils.ResyncTargetFromRequest(req); err != nil {
 		return nil, temporal.NewNonRetryableApplicationError(err.Error(), "InvalidResyncRequest", err)
 	}
-	activity.RecordHeartbeat(ctx, "executing table resync")
-	req.HeartbeatFunc = activity.RecordHeartbeat
+	defer activityHeartbeat(ctx, req)()
 	if err := a.acquireJobExecution(ctx, req); err != nil {
 		return nil, err
 	}
@@ -180,6 +198,7 @@ func (a *Activity) ResyncActivity(ctx context.Context, req *types.ExecutionReque
 }
 
 func (a *Activity) PostResyncActivity(ctx context.Context, req *types.ExecutionRequest, status syncStatus) error {
+	defer activityHeartbeat(ctx, req)()
 	_, workDir := utils.GetWorkflowDirAndSubDir(req.WorkflowID, req.Command)
 	defer utils.ReleaseWorkerLogWriter(workDir)
 	if err := a.executor.CleanupResync(ctx, req, status == syncStatusSuccess); err != nil {
@@ -197,6 +216,7 @@ func (a *Activity) PostResyncActivity(ctx context.Context, req *types.ExecutionR
 		restored.RunID, restored.RuntimeID, restored.LaunchID, restored.LauncherAttemptID = "", "", "", ""
 		restored.ResourceID, restored.ResourceUID = "", ""
 		restored.BeforeLaunch = nil
+		restored.BeginLaunch = nil
 		restored.RecordResource = nil
 		workflowID, scheduleID := utils.SyncWorkflowAndScheduleID(req.ProjectID, req.JobID)
 		return a.tempClient.ScheduleClient().GetHandle(ctx, scheduleID).Update(ctx, client.ScheduleUpdateOptions{DoUpdate: func(input client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {

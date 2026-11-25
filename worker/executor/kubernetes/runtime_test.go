@@ -26,6 +26,7 @@ func controlledPodRequest(command types.Command) *types.ExecutionRequest {
 		WorkflowID: "stable-operation", RunID: "owner-run", LaunchID: "data-launch", RuntimeID: "runtime-a", JobID: 42,
 		Command: command, ConnectorType: "postgres", Version: "v1", AllowLaunch: true, Controlled: true, Timeout: time.Minute,
 		BeforeLaunch:   func(context.Context) error { return nil },
+		BeginLaunch:    func(context.Context) error { return nil },
 		RecordResource: func(context.Context, string, string) error { return nil },
 	}
 }
@@ -46,7 +47,7 @@ func TestControlledKubernetesRecordsUIDImmediatelyAfterCreate(t *testing.T) {
 	req := controlledPodRequest(types.Resync)
 	spec := controlledPod(t, k, req)
 	var events []string
-	req.BeforeLaunch = func(context.Context) error { events = append(events, "authorize"); return nil }
+	req.BeginLaunch = func(context.Context) error { events = append(events, "authorize"); return nil }
 	client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		events = append(events, "create")
 		action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).UID = "created-uid"
@@ -73,7 +74,7 @@ func TestControlledKubernetesCannotCreateAfterAdmissionCloses(t *testing.T) {
 	k := newIndicatorExecutor(client)
 	req := controlledPodRequest(types.ClearDestination)
 	closed := errors.New("admission closed")
-	req.BeforeLaunch = func(context.Context) error { return closed }
+	req.BeginLaunch = func(context.Context) error { return closed }
 	if _, err := k.createControlledPod(context.Background(), req, controlledPod(t, k, req)); !errors.Is(err, closed) {
 		t.Fatalf("closed create error = %v", err)
 	}
@@ -121,7 +122,7 @@ func TestControlledKubernetesRetriesAreAttachOnly(t *testing.T) {
 	viper.Set(constants.EnvStorageMode, constants.StorageModeNFS)
 	t.Cleanup(func() { viper.Set(constants.EnvStorageMode, oldMode) })
 	for _, command := range []types.Command{types.Sync, types.Resync, types.ClearDestination} {
-		for _, state := range []string{"missing", "created", "running", "succeeded", "failed"} {
+		for _, state := range []string{"missing", "created", "starting", "running", "succeeded", "failed"} {
 			t.Run(string(command)+"/"+state, func(t *testing.T) {
 				client := fake.NewClientset()
 				k := newIndicatorExecutor(client)
@@ -135,6 +136,13 @@ func TestControlledKubernetesRetriesAreAttachOnly(t *testing.T) {
 						pod.Status.Phase = corev1.PodRunning
 						pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "connector", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
 					}
+					if state == "starting" {
+						pod.Status.Phase = corev1.PodRunning
+						pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+							{Name: "sidecar", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+							{Name: "connector", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}},
+						}
+					}
 					if state == "succeeded" || state == "failed" {
 						pod.Status.Phase = corev1.PodSucceeded
 						code := int32(0)
@@ -147,7 +155,7 @@ func TestControlledKubernetesRetriesAreAttachOnly(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				if state == "running" {
+				if state == "running" || state == "created" || state == "starting" {
 					reads := 0
 					client.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 						if action.GetSubresource() != "" {
@@ -163,7 +171,7 @@ func TestControlledKubernetesRetriesAreAttachOnly(t *testing.T) {
 					})
 				}
 				logs, err := k.Execute(context.Background(), req, t.TempDir())
-				wantSuccess := state == "running" || state == "succeeded"
+				wantSuccess := state == "running" || state == "created" || state == "starting" || state == "succeeded"
 				if (err == nil) != wantSuccess {
 					t.Fatalf("attach logs=%q error=%v", logs, err)
 				}
