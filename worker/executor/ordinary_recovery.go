@@ -49,7 +49,11 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 			if err := utils.PreserveOrdinaryRecoveryServer(ctx, req, origin); err != nil {
 				return err
 			}
-			return utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files)
+			if err := utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files); err != nil {
+				return err
+			}
+			_, err := utils.PreserveOrdinaryRecoveryCheckpoints(ctx, req, origin, baseline, files)
+			return err
 		} else if !errors.Is(originErr, fs.ErrNotExist) {
 			return originErr
 		}
@@ -135,7 +139,11 @@ func (a *AbstractExecutor) PrepareOrdinaryRecovery(ctx context.Context, req *typ
 		if err := utils.PreserveOrdinaryRecoveryServer(ctx, req, origin); err != nil {
 			return err
 		}
-		return utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files)
+		if err := utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files); err != nil {
+			return err
+		}
+		_, err = utils.PreserveOrdinaryRecoveryCheckpoints(ctx, req, origin, baseline, files)
+		return err
 	})
 }
 
@@ -190,6 +198,13 @@ func (a *AbstractExecutor) ordinaryRecoveryInputs(ctx context.Context, req *type
 		req.Configs = append(req.Configs, types.JobConfig{Name: utils.OrdinaryRecoveryServerFile, Data: server})
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
+	}
+	checkpoint, err := utils.OrdinaryRecoveryCheckpointConfig(ctx, req, origin, baseline, files)
+	if err != nil {
+		return err
+	}
+	if checkpoint != nil {
+		req.Configs = append(req.Configs, *checkpoint)
 	}
 	for _, name := range []string{"source.json", "destination.json", constants.StreamsFile, constants.AvailableStreamsFile, constants.SelectedStreamsFile} {
 		if content, exists := files[name]; exists {
@@ -360,5 +375,39 @@ func confirmedOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest)
 			return "", err
 		}
 	}
+	checkpoint, err := utils.PreserveOrdinaryRecoveryCheckpoints(ctx, req, origin, baseline, files)
+	if err != nil {
+		return "", err
+	}
+	if checkpoint != nil {
+		fixedTarget, err := utils.ParseRecoveryLSN(checkpoint.FinalTargetLSN)
+		if err != nil || fixedTarget != target || result.ToastValueSemantics != checkpoint.ToastValueSemantics {
+			return "", fmt.Errorf("ordinary recovery settlement differs from checkpoint fixed target or TOAST semantics")
+		}
+		identities := make(map[string]string, len(checkpoint.Tables))
+		for _, table := range checkpoint.Tables {
+			identities[table.Stream] = table.TableUUID
+		}
+		for _, table := range result.Tables {
+			if identities[table.Stream] != table.TableUUID {
+				return "", fmt.Errorf("ordinary recovery settlement replaced a checkpoint table identity")
+			}
+		}
+	}
 	return *state, nil
+}
+
+func preserveRetiredOrdinaryRecovery(ctx context.Context, req *types.ExecutionRequest) error {
+	origin, baseline, files, err := utils.ReadOrdinaryRecoveryOrigin(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := utils.PreserveOrdinaryRecoveryServer(ctx, req, origin); err != nil {
+		return err
+	}
+	if err := utils.PreserveBackfillRecoveryBindings(ctx, req, origin, baseline, files); err != nil {
+		return err
+	}
+	_, err = utils.PreserveOrdinaryRecoveryCheckpoints(ctx, req, origin, baseline, files)
+	return err
 }

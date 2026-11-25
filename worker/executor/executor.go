@@ -152,7 +152,13 @@ func (a *AbstractExecutor) RetireExecution(ctx context.Context, req *types.Execu
 		return nil
 	}
 	return a.db.GuardExecution(ctx, req, func(ctx context.Context, current *database.ExecutionRecord) error {
-		return a.executor.Cleanup(ctx, req)
+		if err := a.executor.Cleanup(ctx, req); err != nil {
+			return err
+		}
+		if req.Command == types.Sync && req.RecoverOnly {
+			return preserveRetiredOrdinaryRecovery(ctx, req)
+		}
+		return nil
 	})
 }
 
@@ -278,6 +284,9 @@ func (a *AbstractExecutor) CleanupAndPersistState(ctx context.Context, req *type
 			return a.db.UpdateJobState(ctx, req.JobID, req.WorkflowID, req.RunID, state)
 		}
 		if req.Command == types.Sync && req.RecoverOnly {
+			if err := preserveRetiredOrdinaryRecovery(ctx, req); err != nil {
+				return err
+			}
 			// Recovery completion atomically persists the verified checkpoint and
 			// closes its owner row. Do not use ordinary two-step persistence.
 			return nil

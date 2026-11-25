@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,7 +49,7 @@ func executorEnrollmentFixture(t *testing.T) (*types.ExecutionRequest, string) {
 	viper.Set(constants.EnvStorageMode, constants.StorageModeNFS)
 	viper.Set(constants.EnvKubernetesServiceHost, "")
 	t.Cleanup(func() { viper.Set(constants.EnvStorageMode, mode); viper.Set(constants.EnvKubernetesServiceHost, kube) })
-	id := fmt.Sprintf("executor-test-%s-%d", t.Name(), time.Now().UnixNano())
+	id := fmt.Sprintf("executor-test-%s-%d", strings.ReplaceAll(t.Name(), "/", "-"), time.Now().UnixNano())
 	req := &types.ExecutionRequest{Controlled: true, Command: types.Sync, WorkflowID: id, RunID: "test-run", RuntimeID: id, LaunchID: id, JobID: 42, AllowLaunch: true, BeforeLaunch: func(context.Context) error { return nil }}
 	_, dir := utils.GetExecutionDirAndSubDir(req)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })

@@ -119,3 +119,14 @@ func TestSortPolicyEditsChangeRevisionAndRemainOutsideOrdinaryRecovery(t *testin
 		}
 	}
 }
+
+func TestOrdinaryRecoveryCheckpointFilenameRequiresFlatIdentityAndValidLSN(t *testing.T) {
+	name, err := OrdinaryRecoveryCheckpointFilename("recovery-2", "1A/BC")
+	require.NoError(t, err)
+	require.Equal(t, "recovery-2-1A-BC.json", name)
+	for _, input := range [][2]string{{"", "0/100"}, {".", "0/100"}, {"..", "0/100"}, {"../foreign", "0/100"}, {"parent/child", "0/100"}, {"parent\\child", "0/100"}, {"runtime\x00foreign", "0/100"}, {"runtime", "../state"}, {"runtime", "0/100/1"}, {"runtime", "0/xyz"}, {"runtime", "0/"}} {
+		name, err := OrdinaryRecoveryCheckpointFilename(input[0], input[1])
+		require.Error(t, err)
+		require.Empty(t, name)
+	}
+}
