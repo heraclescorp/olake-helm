@@ -8,8 +8,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 
 	"github.com/datazip-inc/olake-helm/worker/constants"
 	"github.com/datazip-inc/olake-helm/worker/types"
@@ -157,47 +155,4 @@ func ReadFile(ctx context.Context, workDir, relativePath string, validateJSON bo
 		}
 	}
 	return string(data), nil
-}
-
-func ListFiles(ctx context.Context, dir, relativeDir string) ([]string, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var names []string
-	if Mode() == constants.StorageModeS3 {
-		prefix, err := S3Key(dir, relativeDir, true)
-		if err != nil {
-			return nil, err
-		}
-		objects, err := ListS3Objects(ctx, prefix)
-		if err != nil {
-			return nil, err
-		}
-		for _, object := range objects {
-			name := strings.TrimPrefix(object.Key, prefix)
-			if name == "" {
-				continue
-			}
-			if !strings.HasPrefix(object.Key, prefix) || strings.Contains(name, "/") {
-				return nil, fmt.Errorf("unexpected nested storage artifact %q", object.Key)
-			}
-			names = append(names, name)
-		}
-	} else {
-		entries, err := os.ReadDir(filepath.Join(dir, relativeDir))
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, entry := range entries {
-			if !entry.Type().IsRegular() {
-				return nil, fmt.Errorf("unexpected non-file storage artifact %q", entry.Name())
-			}
-			names = append(names, entry.Name())
-		}
-	}
-	sort.Strings(names)
-	return names, nil
 }
